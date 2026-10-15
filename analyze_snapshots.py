@@ -112,6 +112,7 @@ class MinuteRVAnalyzer:
         self.timestamp: object = ""
         self.event_changed = False
         self.current: tuple[datetime, float] | None = None
+        self._completed_stats: dict[str, object] | None = None
 
     def reset(self) -> None:
         self.points.clear()
@@ -119,6 +120,7 @@ class MinuteRVAnalyzer:
         self.timestamp = ""
         self.event_changed = False
         self.current = None
+        self._completed_stats = None
 
     def update(self, row: dict[str, object]) -> dict[str, object] | None:
         self.event_changed = False
@@ -139,23 +141,41 @@ class MinuteRVAnalyzer:
             raise ValueError("Out-of-order minute")
         if self.current and bucket > self.current[0]:
             self.points.append(self.current)
+            self._completed_stats = None
         self.event_changed = self.current != (bucket, level)
         self.current = (bucket, level)
         cutoff = bucket - timedelta(minutes=self.minutes)
         while self.points and self.points[0][0] < cutoff:
             self.points.popleft()
+            self._completed_stats = None
         return self.result()
 
     def result(self) -> dict[str, object] | None:
         if self.current is None:
             return None
-        levels = [level for _, level in self.points]
         latest = self.current[1]
-        mean = statistics.fmean(levels) if levels else latest
-        stdev = statistics.stdev(levels) if len(levels) >= 2 else 0.0
-        ready = len(levels) >= self.min_samples
+        if self._completed_stats is None:
+            points = list(self.points)
+            levels = [level for _, level in points]
+            # Fixed-time changes, including unchanged minute closes. Never
+            # confuse level dispersion or an event-time change with P&L risk.
+            changes = [right[1] - left[1] for left, right in zip(points, points[1:])
+                       if right[0] - left[0] == timedelta(minutes=1)]
+            self._completed_stats = {
+                "samples": len(levels),
+                "level_mean": statistics.fmean(levels) if levels else None,
+                "level_stdev": statistics.stdev(levels) if len(levels) >= 2 else 0.0,
+                "minute_change_samples": len(changes),
+                "minute_change_stdev": statistics.stdev(changes) if len(changes) >= 2 else None,
+                "minute_change_ready": len(levels) >= self.min_samples and len(changes) >= 2
+                                       and len(changes) == len(levels) - 1,
+            }
+        stats = self._completed_stats
+        mean = latest if stats["level_mean"] is None else stats["level_mean"]
+        stdev = stats["level_stdev"]
+        ready = stats["samples"] >= self.min_samples
         zscore = (latest - mean) / stdev if ready and stdev > 1e-12 else 0.0
-        return {"timestamp_utc": self.timestamp, "samples": len(levels), "required_samples": self.min_samples,
+        return {**stats, "timestamp_utc": self.timestamp, "required_samples": self.min_samples,
                 "latest_rv_level": latest, "level_mean": mean, "level_stdev": stdev,
                 "zscore": zscore, "level_zscore": zscore, "beta": self.beta,
                 "window_minutes": self.minutes, "ready": ready}

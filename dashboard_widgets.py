@@ -1,0 +1,197 @@
+"""Native Tk dashboard components; no browser, plotting or animation runtime."""
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk
+
+BG = "#eef2f6"
+PANEL = "#ffffff"
+INK = "#172b43"
+MUTED = "#52657a"
+LINE = "#dce4ec"
+ACCENT = "#176b83"
+WARN = "#9a5911"
+
+
+class ValueLabel(tk.Label):
+    """Avoid Tcl redraw/configure work when the displayed value is unchanged."""
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
+        self._displayed = dict(kwargs)
+
+    def config(self, cnf=None, **kwargs):
+        if cnf is not None:
+            return super().configure(cnf, **kwargs)
+        changed = {key: value for key, value in kwargs.items() if self._displayed.get(key) != value}
+        if changed:
+            super().configure(**changed)
+            self._displayed.update(changed)
+
+
+def text(parent, value="", size=10, color=INK, bold=False, **kwargs):
+    label = ValueLabel(parent, text=value, bg=parent.cget("bg"), fg=color,
+                       font=("맑은 고딕", size, "bold" if bold else "normal"),
+                       anchor="w", justify="left", wraplength=500, **kwargs)
+    # Follow the containing panel, not the label's own requested size. Binding
+    # to the label creates a geometry feedback loop on shrink-to-fit controls.
+    padding = parent.winfo_pixels(parent.cget("padx"))
+    parent.bind("<Configure>", lambda event: label.config(
+        wraplength=max(80, event.width - 2 * padding - 12)), add="+")
+    return label
+
+
+def panel(parent, title, subtitle=None):
+    frame = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=18, pady=12)
+    text(frame, title, 11, bold=True).pack(fill="x")
+    if subtitle:
+        text(frame, subtitle, 9, MUTED).pack(fill="x", pady=(3, 8))
+    return frame
+
+
+def row_label(parent, value="", **kwargs):
+    label = text(parent, value, **kwargs)
+    label.pack(fill="x", pady=5)
+    return label
+
+
+def scroll_page(notebook, title):
+    outer = tk.Frame(notebook, bg=BG)
+    notebook.add(outer, text=title)
+    canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    page = tk.Frame(canvas, bg=BG, padx=1, pady=10)
+    item = canvas.create_window((0, 0), window=page, anchor="nw")
+    canvas.bind("<Configure>", lambda event: canvas.itemconfigure(item, width=event.width))
+    page.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+    # Toplevel bind runs only for events belonging to this dashboard. Scope the
+    # scroll to the page under the pointer, including labels nested inside it.
+    def wheel(event):
+        widget = event.widget
+        while widget is not None:
+            if widget is outer:
+                if page.winfo_height() > canvas.winfo_height():
+                    canvas.yview_scroll(-int(event.delta / 120), "units")
+                break
+            widget = getattr(widget, "master", None)
+    notebook.winfo_toplevel().bind("<MouseWheel>", wheel, add="+")
+    return page
+
+
+def build_dashboard(view):
+    view.title("KTB | 국채선물 모니터")
+    view.geometry("1180x800")
+    view.minsize(960, 720)
+    view.configure(bg=BG)
+    style = ttk.Style(view)
+    style.theme_use("clam")
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", font=("맑은 고딕", 10), padding=(18, 9),
+                    background="#e3eaf1", foreground=MUTED)
+    style.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", ACCENT)])
+
+    shell = tk.Frame(view, bg=BG, padx=22, pady=14)
+    shell.pack(fill="both", expand=True)
+    header = tk.Frame(shell, bg=BG)
+    header.pack(fill="x")
+    text(header, "KTB  /  국채선물 모니터", 19, bold=True).pack(side="left", fill="x", expand=True)
+    tk.Button(header, text="가격 알림 설정", command=view.open_alert_editor,
+              bg=ACCENT, fg="white", activebackground="#12566b", activeforeground="white",
+              relief="flat", font=("맑은 고딕", 10), padx=16, pady=6, cursor="hand2").pack(side="right")
+    view.status = text(shell, "수집 데이터 대기", 9, MUTED)
+    view.status.pack(fill="x", pady=(6, 12))
+
+    cards = tk.Frame(shell, bg=BG)
+    cards.pack(fill="x")
+    view.kpis = {}
+    definitions = (("3y_trade_price", "3년 선물", "최근 체결가 · pt"),
+                   ("10y_trade_price", "10년 선물", "최근 체결가 · pt"),
+                   ("futures_spread", "선물 가격차", "10년 − 3년 · pt"),
+                   ("cash_spread_bp", "현물 금리차", "10년 − 3년 · bp"))
+    for column, (key, title, unit) in enumerate(definitions):
+        cards.columnconfigure(column, weight=1, uniform="kpi")
+        card = panel(cards, title)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+        value = ValueLabel(card, text="—", bg=PANEL, fg=INK, anchor="w", font=("Segoe UI", 26, "bold"))
+        value.pack(fill="x", pady=(5, 0))
+        text(card, unit, 9, MUTED).pack(fill="x")
+        view.kpis[key] = value
+
+    view.decision = text(shell, "데이터 대기", 11, ACCENT, True, padx=12, pady=9)
+    view.decision.pack(fill="x", pady=(10, 8))
+    notebook = ttk.Notebook(shell)
+    notebook.pack(fill="both", expand=True)
+    view.notebook = notebook
+    pages = []
+    for title in ("변동성 · 위험", "외국인 수급", "호가 · 비용"):
+        pages.append(scroll_page(notebook, title))
+    risk_page, foreign_page, book_page = pages
+
+    risk_page.columnconfigure(0, weight=1, uniform="risk")
+    risk_page.columnconfigure(1, weight=1, uniform="risk")
+    vol = panel(risk_page, "01  변동성 관측", "완료된 1분 가격 변화 기준")
+    vol.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    view.volatility = row_label(vol, "준비 중", size=13, color=ACCENT, bold=True)
+    row_label(vol, "합성 RV = 10Y mid − β × 3Y mid\n가격 수준의 Z-score와 별도로 계산합니다.", size=9, color=MUTED)
+    sizing = panel(risk_page, "02  위험예산 · 수량", "현재 구현 상태")
+    sizing.grid(row=0, column=1, sticky="nsew")
+    row_label(sizing, "목표 변동성 기반 수량 미구현", size=12, color=WARN, bold=True)
+    row_label(sizing, "일간 패키지 손익 이력·위험예산이 필요합니다.\n아래 DV01은 헤지 비율과 가상 패키지 한도입니다.", size=9, color=MUTED)
+    hedge = panel(risk_page, "03  DV01 헤지 · 한도")
+    hedge.grid(row=1, column=0, columnspan=2, sticky="ew", pady=8)
+    view.risk = row_label(hedge, view._risk_text(), size=10)
+    signal = panel(risk_page, "04  상대가격 이탈 관측", "빠른 창은 이벤트 수, 주 창은 완료된 분 수입니다.")
+    signal.grid(row=2, column=0, columnspan=2, sticky="ew")
+    view.fast_rv = row_label(signal, "빠른 RV: 대기", size=10)
+    view.core_rv = row_label(signal, "주 RV: 대기", size=10, bold=True)
+    view.window_note = row_label(signal, "60분 기준은 장중 관측용이며 수일·수주 적정가 기준은 없습니다.", size=9, color=MUTED)
+
+    flow = panel(foreign_page, "외국인 관측 가격대", "누적 매수·매도 증가량에 당시 체결가를 결합한 추정치입니다.")
+    flow.pack(fill="x")
+    view.foreign_3y = row_label(flow, "3Y 외국인: 데이터 대기", size=11)
+    tk.Frame(flow, bg=LINE, height=1).pack(fill="x", pady=10)
+    view.foreign_10y = row_label(flow, "10Y 외국인: 데이터 대기", size=11)
+    row_label(flow, "관측 시작 이전 거래는 평균에 포함되지 않습니다. 실제 평균체결가·보유원가는 알 수 없습니다.", size=9, color=MUTED)
+    market = panel(foreign_page, "데이터 연결 · 가격차")
+    market.pack(fill="x", pady=10)
+    view.market_spreads = row_label(market, "추가 RTD 대기", size=10)
+
+    book = panel(book_page, "호가 상세", "호가잔량은 체결 수급과 구분해서 봅니다.")
+    book.pack(fill="x")
+    view.labels = {}
+    for column, name in enumerate(("항목", "3년", "10년", "의미")):
+        book.columnconfigure(column, weight=1 if column < 3 else 2)
+    # Inner table keeps grid and pack geometry managers in separate containers.
+    grid = tk.Frame(book, bg=PANEL)
+    grid.pack(fill="x")
+    for column, name in enumerate(("항목", "3년", "10년", "의미")):
+        grid.columnconfigure(column, weight=1 if column < 3 else 2)
+        text(grid, name, 9, MUTED, True).grid(row=0, column=column, sticky="ew", pady=(0, 6))
+    entries = (("mid", "중간 호가", "최우선 매수·매도 중간값"),
+               ("spread", "호가 간격", "최우선 매도 − 매수 · pt"),
+               ("obi", "잔량 불균형", "+ 매수잔량 우위 / − 매도잔량 우위"),
+               ("weighted_obi", "가중 불균형", "가까운 호가의 잔량에 높은 가중치"),
+               ("microprice", "잔량 가중가격", "최우선 호가 잔량 기반 가격"),
+               ("bid_depth", "매수 총잔량", "5단계 합계 · 계약"),
+               ("ask_depth", "매도 총잔량", "5단계 합계 · 계약"))
+    for index, (key, title, hint) in enumerate(entries, 1):
+        text(grid, title, 10).grid(row=index, column=0, sticky="ew", pady=3)
+        for column, name in enumerate(("3y", "10y"), 1):
+            label = ValueLabel(grid, text="—", bg=PANEL, fg=INK, anchor="e", font=("Consolas", 11))
+            label.grid(row=index, column=column, sticky="ew", padx=(0, 20), pady=3)
+            view.labels[(name, key)] = label
+        text(grid, hint, 9, MUTED).grid(row=index, column=3, sticky="ew")
+    detail = panel(book_page, "호가 압력 · 비용 · 수동 적정가")
+    detail.pack(fill="x", pady=(8, 0))
+    view.flow = row_label(detail, "호가 압력: 대기", size=9)
+    view.cost = row_label(detail, "비용필터: 대기", size=9)
+    view.basis = row_label(detail, "수동 적정가: 미설정", size=9)
+
+    footer = tk.Frame(shell, bg=BG)
+    footer.pack(fill="x", pady=(8, 0))
+    view.alert_status = text(footer, view._alert_summary(), 9, ACCENT)
+    view.alert_status.pack(side="left", fill="x", expand=True)
+    text(footer, "의사결정 지원  ·  자동 주문 없음", 9, MUTED).pack(side="right")

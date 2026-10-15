@@ -3,6 +3,7 @@ import csv
 import json
 import tempfile
 import unittest
+from collections import deque
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,14 +38,17 @@ def quote(seconds=0, mid10=100.0):
 class SafetyTests(unittest.TestCase):
     def _headless_dashboard(self, rows):
         view = SimpleNamespace(settings=AppSettings(), extra_settings=ExtraSettings(), rejected_rows=0,
-                               tail=MagicMock(), after=MagicMock(), winfo_id=MagicMock(return_value=1))
+                               tail=MagicMock(), after=MagicMock(), winfo_id=MagicMock(return_value=1),
+                               pending_rows=deque(), replaying=False, kpis={
+                                   key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
+                                                               "futures_spread", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_decision_text", "_flow_text", "_basis_text", "_cost_text",
-                       "_market_text", "_foreign_text", "refresh"):
+                       "_market_text", "_foreign_text", "_render_overview", "_clear_market_display", "refresh"):
             setattr(view, method, MethodType(getattr(Dashboard, method), view))
         view._rv_text = Dashboard._rv_text
         view._reset_analyzers()
         for name in ("status", "decision", "fast_rv", "core_rv", "flow", "basis", "cost",
-                     "market_spreads", "foreign_3y", "foreign_10y", "alert_status"):
+                     "market_spreads", "foreign_3y", "foreign_10y", "alert_status", "volatility", "window_note"):
             setattr(view, name, MagicMock())
         view.labels = {(name, key): MagicMock() for name in ("3y", "10y") for key in
                        ("mid", "spread", "obi", "weighted_obi", "microprice", "bid_depth", "ask_depth")}
@@ -74,6 +78,47 @@ class SafetyTests(unittest.TestCase):
             view.refresh()
         self.assertIsNone(view.latest_row)
         self.assertIn("신호 차단", view.decision.config.call_args.kwargs["text"])
+        self.assertEqual(view.kpis["futures_spread"].config.call_args.kwargs["text"], "—")
+
+    def test_dashboard_batches_history_without_dropping_rows_or_replaying_alerts(self):
+        view = self._headless_dashboard([quote(i / 4, 100 + i / 10000) for i in range(620)])
+        view.tail.read_new.return_value = (view.tail.read_new.return_value[0], True)
+        with patch("dashboard.current_csv", return_value=Path("test.csv")):
+            view.refresh()
+            self.assertGreater(len(view.pending_rows), 0)
+            self.assertIn("사용 금지", view.decision.config.call_args.kwargs["text"])
+            while view.pending_rows:
+                view.refresh()
+        view.tail.read_new.assert_called_once()
+        self.assertEqual(view.latest_row["timestamp_utc"], quote(619 / 4)["timestamp_utc"])
+        view.after.assert_any_call(25, view.refresh)
+
+    def test_minute_change_risk_is_completed_fixed_time_not_level_dispersion(self):
+        analyzer = MinuteRVAnalyzer(4, 1)
+        for minute, price in enumerate((100, 101, 103, 102, 150)):
+            result = analyzer.update(quote(minute * 60, price))
+        # Completed levels 0, 1, 3, 2; changes +1,+2,-1.
+        self.assertEqual(result["minute_change_samples"], 3)
+        self.assertAlmostEqual(result["minute_change_stdev"], (7 / 3) ** .5)
+        self.assertTrue(result["minute_change_ready"])
+        cached = analyzer._completed_stats
+        intraminute = analyzer.update(quote(241, 170))
+        self.assertIs(analyzer._completed_stats, cached)
+        self.assertEqual(result["minute_change_stdev"], intraminute["minute_change_stdev"])
+        analyzer.reset()
+        self.assertIsNone(analyzer.update(quote())["minute_change_stdev"])
+
+    def test_minute_change_risk_excludes_missing_minutes_and_keeps_zero_changes(self):
+        analyzer = MinuteRVAnalyzer(4, 1)
+        for minute in (0, 1, 3, 4):
+            result = analyzer.update(quote(minute * 60, 100))
+        self.assertEqual(result["minute_change_samples"], 1)
+        self.assertFalse(result["minute_change_ready"])
+        analyzer.reset()
+        for minute in range(5):
+            result = analyzer.update(quote(minute * 60, 100))
+        self.assertEqual(result["minute_change_samples"], 3)
+        self.assertEqual(result["minute_change_stdev"], 0)
 
     def test_settings_reject_nonfinite_bool_fraction_unknown_and_missing(self):
         invalid = [{"rv": {"beta": float("nan")}}, {"rv": {"beta": True}},

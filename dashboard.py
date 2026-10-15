@@ -1,5 +1,7 @@
 from __future__ import annotations
 import csv, json, math, os, tkinter as tk
+from collections import deque
+from time import perf_counter
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +12,7 @@ from extra_settings import METRICS, AlertRule, load_extra_settings, parse_settin
 from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
                                market_metrics, metric_is_fresh, source_timestamp)
 from signal_engine import SignalEngine
+from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
 
 DATA_DIR = Path(__file__).parent / "data"
 SETTINGS_PATH = Path(__file__).parent / "settings.json"
@@ -101,7 +104,7 @@ def numeric_row(row: dict[str, str]) -> dict[str, object]:
 
 class Dashboard(tk.Tk):
     def __init__(self):
-        super().__init__(); self.title("KTB RTD Dashboard"); self.geometry("1120x880"); self.configure(bg="#101820")
+        super().__init__()
         self.settings: AppSettings = load_settings(SETTINGS_PATH)
         self.extra_settings = load_extra_settings(EXTRA_SETTINGS_PATH)
         self.tail = IncrementalCsvTail()
@@ -114,35 +117,9 @@ class Dashboard(tk.Tk):
         self.fast_result: dict[str, object] | None = None
         self.core_result: dict[str, object] | None = None
         self.flow_result: dict[str, object] | None = None
-        self.labels = {}
-        tk.Label(self, text="KTB RTD Dashboard  |  observation only", fg="white", bg="#101820", font=("Segoe UI", 16, "bold")).pack(pady=12)
-        self.status = tk.Label(self, text="Waiting for snapshots...", fg="#9fb3c8", bg="#101820", font=("Consolas", 10)); self.status.pack()
-        grid = tk.Frame(self, bg="#101820"); grid.pack(pady=18)
-        for c, title in enumerate(("Metric", "3Y", "10Y", "Interpretation")): tk.Label(grid, text=title, width=24, fg="#8ed1fc", bg="#1b2a38", font=("Segoe UI", 11, "bold")).grid(row=0, column=c, padx=2, pady=2)
-        for r, key, title in ((1,"mid","Mid"),(2,"spread","Spread"),(3,"obi","OBI"),(4,"weighted_obi","WOBI"),(5,"microprice","Microprice"),(6,"bid_depth","Bid depth"),(7,"ask_depth","Ask depth")):
-            tk.Label(grid, text=title, width=24, fg="white", bg="#101820", anchor="w").grid(row=r,column=0,padx=2,pady=3)
-            for c, name in enumerate(("3y","10y"),1):
-                label=tk.Label(grid,text="-",width=24,fg="#e8f1f2",bg="#243746",font=("Consolas",11)); label.grid(row=r,column=c,padx=2,pady=3); self.labels[(name,key)]=label
-            help_text = {"mid":"현재 최우선 호가의 단순 중간값", "spread":"매수-매도 간격; 작을수록 유동성 양호", "obi":"5단계 전체 잔량: + 매수 우세 / - 매도 우세", "weighted_obi":"WOBI: 가까운 호가에 높은 가중치; + 매수 압력 / - 매도 압력", "microprice":"최우선 호가 잔량으로 가중한 예상 중심가격", "bid_depth":"5단계 매수 총잔량", "ask_depth":"5단계 매도 총잔량"}[key]
-            tk.Label(grid, text=help_text, width=38, fg="#b8c7d1", bg="#101820", anchor="w", wraplength=270, justify="left").grid(row=r,column=3,padx=4,pady=3)
-        self.fast_rv = tk.Label(self, text="빠른 RV: -", fg="#ffd166", bg="#101820", font=("Consolas", 12)); self.fast_rv.pack(pady=(10, 2))
-        self.core_rv = tk.Label(self, text="주 RV: -", fg="#8ed1fc", bg="#101820", font=("Consolas", 12, "bold")); self.core_rv.pack(pady=2)
-        self.decision = tk.Label(self, text="종합 판단: 데이터 대기", fg="white", bg="#243746", font=("Segoe UI", 12, "bold"), width=100); self.decision.pack(pady=8)
-        self.flow = tk.Label(self, text="호가잔량 압력: 데이터 대기", fg="#d6e6f2", bg="#101820", font=("Segoe UI", 10)); self.flow.pack(pady=2)
-        self.basis = tk.Label(self, text="수동 적정가 비교: 입력 대기", fg="#d6e6f2", bg="#101820", font=("Segoe UI", 10)); self.basis.pack(pady=2)
-        self.cost = tk.Label(self, text="체결비용: 신호 대기", fg="#d6e6f2", bg="#101820", font=("Segoe UI", 10)); self.cost.pack(pady=2)
-        self.risk = tk.Label(self, text=self._risk_text(), fg="#b8c7d1", bg="#101820", font=("Segoe UI", 10)); self.risk.pack(pady=2)
-        self.market_spreads = tk.Label(self, text="체결가차: 추가 RTD 대기", fg="#ffe08a", bg="#101820",
-                                       font=("Segoe UI", 11, "bold")); self.market_spreads.pack(pady=(10, 2))
-        self.foreign_3y = tk.Label(self, text="3Y 외국인 관측 가격대: 추가 RTD 대기", fg="#c9d8e4", bg="#101820",
-                                  font=("Segoe UI", 10)); self.foreign_3y.pack(pady=2)
-        self.foreign_10y = tk.Label(self, text="10Y 외국인 관측 가격대: 추가 RTD 대기", fg="#c9d8e4", bg="#101820",
-                                   font=("Segoe UI", 10)); self.foreign_10y.pack(pady=2)
-        alert_frame = tk.Frame(self, bg="#101820"); alert_frame.pack(pady=8)
-        tk.Button(alert_frame, text="가격 알림 설정", command=self.open_alert_editor,
-                  bg="#31495d", fg="white", activebackground="#46647b").pack(side="left", padx=5)
-        self.alert_status = tk.Label(alert_frame, text=self._alert_summary(), fg="#8ed1fc", bg="#101820",
-                                     font=("Segoe UI", 10)); self.alert_status.pack(side="left", padx=8)
+        self.pending_rows = deque()
+        self.replaying = False
+        build_dashboard(self)
         self.after(500, self.refresh)
 
     def _reset_analyzers(self) -> None:
@@ -169,13 +146,13 @@ class Dashboard(tk.Tk):
         self.extra_settings = load_extra_settings(EXTRA_SETTINGS_PATH)
         self.alert_engine = AlertEngine(self.extra_settings.rules)
         self.notifier = WindowsNotifier(self.extra_settings)
-        self.alert_status.config(text=self._alert_summary())
+        self.alert_status.config(text=self._alert_summary(), fg=ACCENT)
 
     def _risk_text(self) -> str:
         metrics = risk_metrics(self.settings.risk)
         if metrics is None:
             return (f"DV01: 미설정 | 연구 beta {self.settings.rv.beta:.4f} 사용 | "
-                    "settings.json에 계약별 원/bp 값을 입력하면 DV01 beta로 전환합니다.")
+                    "계약별 DV01(원/bp)을 입력하면 헤지 비율을 계산합니다.")
         return (f"DV01 헤지: 10Y {metrics['contracts_10y']}계약당 3Y {metrics['exact_3y']:.2f}계약 "
                 f"| 정수 패키지 {metrics['rounded_3y']}:{metrics['contracts_10y']} "
                 f"| 총 {metrics['gross_dv01']:,.0f}원/bp | 잔여 {metrics['residual_dv01']:,.0f}원/bp "
@@ -233,7 +210,26 @@ class Dashboard(tk.Tk):
                 parts.append(f"{label} 추정 {item['estimated_avg_price']:.3f}{yld} "
                              f"| 주구간 {item['dominant_price_low']:.2f}~{item['dominant_price_high']:.2f} "
                              f"(관측증가 {item['observed_volume']:,.0f})")
-        return prefix + (" | " + " | ".join(parts) if parts else " | 기준점 설정 중") + " | 실제 평균체결가 아님"
+        return prefix + ("\n" + "\n".join(parts) if parts else " | 기준점 설정 중")
+
+    def _render_overview(self, row: dict[str, object] | None, fresh: bool) -> None:
+        metrics = market_metrics(row) if row else {}
+        for key, label in self.kpis.items():
+            value = metrics.get(key)
+            rendered = "—" if value is None else (f"{value:+.1f}" if key == "cash_spread_bp"
+                       else f"{value:+.3f}" if key == "futures_spread" else f"{value:.3f}")
+            label.config(text=rendered, fg=INK if fresh else MUTED)
+        core = self.core_result or {}
+        samples = int(core.get("minute_change_samples", 0))
+        if core.get("minute_change_ready"):
+            value = float(core["minute_change_stdev"])
+            self.volatility.config(text=f"1분 변화 σ  {value:.5f} pt\n{samples}개 변화 표본 · 연율 환산 없음",
+                                   fg=ACCENT if fresh else MUTED)
+        else:
+            self.volatility.config(text=f"준비 중 · 1분 변화 {samples}개\n완료 {self.settings.rv.core_minutes}분 필요", fg=MUTED)
+        span = float((self.fast_result or {}).get("span_seconds", 0))
+        self.window_note.config(text=f"빠른 {self.settings.rv.fast_event_window}이벤트의 실제 길이: {span / 60:.1f}분\n"
+                                f"주 {self.settings.rv.core_minutes}분은 장중 기준 · 수일/수주 기준 및 변동성 타겟팅 미구현")
 
     def _decision_text(self) -> str:
         rv = self.settings.rv
@@ -259,11 +255,18 @@ class Dashboard(tk.Tk):
     def refresh(self):
         try:
             csv_path = current_csv()
-            rows, reset = self.tail.read_new(csv_path)
-            if reset:
-                self._reset_analyzers()
+            if not self.pending_rows:
+                rows, reset = self.tail.read_new(csv_path)
+                if reset:
+                    self._reset_analyzers()
+                self.pending_rows.extend(rows)
+                self.replaying = reset
             alert_events = []
-            for raw in rows:
+            deadline = perf_counter() + .020
+            processed = 0
+            while self.pending_rows and processed < 250 and perf_counter() < deadline:
+                raw = self.pending_rows.popleft()
+                processed += 1
                 try:
                     row = numeric_row(raw)
                     # Validate display-only metrics as well as shared quotes.
@@ -294,7 +297,7 @@ class Dashboard(tk.Tk):
                             <= self.extra_settings.max_source_age_seconds):
                         tracker.update(row, timestamp, session)
                 age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
-                if not reset:
+                if not self.replaying:
                     metrics = market_metrics(row)
                     freshness = {metric: 0 <= age <= self.extra_settings.stale_seconds
                                  and metric_is_fresh(row, metric, timestamp, self.extra_settings)
@@ -304,44 +307,59 @@ class Dashboard(tk.Tk):
             if alert_events:
                 last = alert_events[-1]
                 self.notifier.notify(self.winfo_id())
-                self.alert_status.config(text=f"알림: {last.name} | {last.value:+.3f}", fg="#ffd166")
+                self.alert_status.config(text=f"알림: {last.name} | {last.value:+.3f}", fg=WARN)
             if self.latest_row:
                 row = self.latest_row
                 timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
                 age = (datetime.now(timezone.utc) - timestamp).total_seconds()
-                fresh = 0 <= age <= self.settings.data.stale_seconds
-                health = "수집시각 최신 (거래소 피드 신선도 미검증)" if fresh else f"과거/미래 시각 {age:.0f}초 — 신호 차단"
-                self.status.config(text=f"UTC {row['timestamp_utc']} | {health} | 제외 {self.rejected_rows}행 | {csv_path.name}")
+                fresh = 0 <= age <= self.settings.data.stale_seconds and not self.pending_rows
+                health = "수집 최신 · 원천시각 별도 확인" if fresh else f"지연/시각 이상 ({age:.0f}초) · 신호 차단"
+                if self.pending_rows:
+                    health = f"기록 읽는 중 · {len(self.pending_rows):,}행 남음"
+                self.status.config(text=f"{timestamp_kst(timestamp):%m/%d %H:%M:%S} KST  |  {health}  |  제외 {self.rejected_rows}행  |  {csv_path.name}",
+                                   fg=MUTED if fresh else WARN)
                 for name in ("3y","10y"):
                     for key in ("mid","spread","obi","weighted_obi","microprice","bid_depth","ask_depth"):
-                        value=float(row[f"{name}_{key}"]); text=f"{value:.4f}" if key in ("mid","microprice") else (f"{value:+.3f}" if "obi" in key else f"{value:.3f}")
+                        value=float(row[f"{name}_{key}"]); text=f"{value:,.0f}" if "depth" in key else (f"{value:+.3f}" if "obi" in key else f"{value:.3f}")
                         self.labels[(name,key)].config(text=text)
                 rv = self.settings.rv
                 self.fast_rv.config(text=self._rv_text(f"빠른 RV ({rv.fast_event_window} 이벤트)", self.fast_result,
                                                        rv.fast_event_window, "이벤트"))
                 self.core_rv.config(text=self._rv_text(f"주 RV (완료 {rv.core_minutes}분)", self.core_result,
                                                        rv.core_minutes, "분"))
-                self.decision.config(text=self._decision_text() if fresh else "데이터 시각 이상/지연: 현재 신호 사용 금지")
+                self.decision.config(text=self._decision_text() if fresh else "데이터 준비/지연: 현재 신호 사용 금지",
+                                     fg=ACCENT if fresh else WARN)
                 self.flow.config(text=self._flow_text())
                 self.basis.config(text=self._basis_text(row))
                 self.cost.config(text=self._cost_text(row))
                 self.market_spreads.config(text=self._market_text(row))
                 self.foreign_3y.config(text=self._foreign_text("3y", row))
                 self.foreign_10y.config(text=self._foreign_text("10y", row))
+                self._render_overview(row, fresh)
             else:
                 self.status.config(text=f"유효 데이터 대기 | 제외 {self.rejected_rows}행")
                 self.decision.config(text="유효 데이터 없음 — 신호 차단")
                 self.flow.config(text="호가잔량 압력: 데이터 대기")
                 self.basis.config(text="수동 적정가 비교: 데이터 대기")
                 self.cost.config(text="비용필터: 데이터 대기")
+                self._clear_market_display()
         except (OSError, KeyError, ValueError, TypeError, csv.Error) as exc:
             self._reset_analyzers()
+            self.pending_rows.clear()
             self.status.config(text=f"데이터 오류: {exc}")
             self.decision.config(text="오류로 신호 차단 — 새 데이터로 재준비")
             self.flow.config(text="호가잔량 압력: 오류로 중단")
             self.basis.config(text="수동 적정가 비교: 오류로 중단")
             self.cost.config(text="비용필터: 오류로 중단")
-        self.after(500, self.refresh)
+            self._clear_market_display()
+        self.after(25 if self.pending_rows else 500, self.refresh)
+
+    def _clear_market_display(self) -> None:
+        for label in self.labels.values():
+            label.config(text="—")
+        for label in (self.fast_rv, self.core_rv, self.market_spreads, self.foreign_3y, self.foreign_10y):
+            label.config(text="유효 데이터 대기")
+        self._render_overview(None, False)
 
 
 class AlertEditor(tk.Toplevel):
