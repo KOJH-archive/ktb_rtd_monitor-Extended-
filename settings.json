@@ -1,0 +1,39 @@
+{
+  "data": {
+    "max_gap_seconds": 10.0,
+    "stale_seconds": 10.0
+  },
+  "rv": {
+    "beta": 2.88,
+    "fast_event_window": 120,
+    "core_minutes": 60,
+    "entry_z": 2.0,
+    "exit_z": 1.5,
+    "confirmation_seconds": 3.0
+  },
+  "risk": {
+    "dv01_3y_krw_per_bp": null,
+    "dv01_10y_krw_per_bp": null,
+    "package_10y_contracts": 1,
+    "max_gross_dv01_krw_per_bp": null,
+    "max_residual_dv01_krw_per_bp": null
+  },
+  "flow": {
+    "ema_alpha": 0.2,
+    "obi_weight": 0.3,
+    "weighted_obi_weight": 0.5,
+    "microprice_weight": 0.2,
+    "relative_threshold": 0.25
+  },
+  "basis": {
+    "fair_3y_price": null,
+    "fair_10y_price": null,
+    "extra_cost_3y_points": 0.0,
+    "extra_cost_10y_points": 0.0,
+    "min_net_edge_points": 0.01
+  },
+  "execution": {
+    "min_edge_to_roundtrip_cost": 1.25,
+    "extra_roundtrip_cost_points": 0.0
+  }
+}

@@ -6,16 +6,30 @@ import csv
 import sqlite3
 import sys
 import time
-import statistics
+import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from analyze_snapshots import RollingRVAnalyzer, timestamp_kst
+from extra_settings import ExtraSettings, load_extra_settings
+from market_extensions import market_metrics
 
-try:
-    import xlwings as xw
-except ImportError:  # Lets calculation tests run before the Windows Excel dependency is installed.
-    xw = None
+# Importing xlwings can initialize the Excel/COM stack. Keep it out of analysis,
+# dashboard, and test startup; only the collector needs it.
+xw = None
+
+
+def _load_xlwings():
+    global xw
+    if xw is None:
+        try:
+            import xlwings as xlwings_module
+        except ImportError as exc:
+            raise FeedUnavailable("xlwings is not installed. Run: pip install -r requirements.txt") from exc
+        xw = xlwings_module
+    return xw
 
 WEIGHTS = (1.0, 0.7, 0.5, 0.3, 0.2)
 
@@ -52,7 +66,7 @@ def _numbers(values: Iterable[object], label: str, expected_len: int = 5) -> lis
             number = float(value)
         except (TypeError, ValueError) as exc:
             raise FeedUnavailable(f"{label}: non-numeric RTD value {value!r}") from exc
-        if number <= 0:
+        if not math.isfinite(number) or number <= 0:
             raise FeedUnavailable(f"{label}: non-positive value {number}")
         result.append(number)
     if len(result) != expected_len:
@@ -60,18 +74,18 @@ def _numbers(values: Iterable[object], label: str, expected_len: int = 5) -> lis
     return result
 
 
-def _column(sheet: xw.Sheet, address: str, label: str) -> list[float]:
-    return _numbers(sheet.range(address).options(ndim=1).value, label)
-
-
 def _metrics(prefix: str, bid_prices: list[float], bid_qty: list[float],
              ask_prices: list[float], ask_qty: list[float]) -> dict[str, float]:
+    bid_prices = _numbers(bid_prices, f"{prefix} bid prices")
+    ask_prices = _numbers(ask_prices, f"{prefix} ask prices")
+    bid_qty = _numbers(bid_qty, f"{prefix} bid quantities")
+    ask_qty = _numbers(ask_qty, f"{prefix} ask quantities")
     # Excel stores ask levels from 5th ask to best ask; normalize both sides to best→5th.
     ask_prices, ask_qty = list(reversed(ask_prices)), list(reversed(ask_qty))
     if bid_prices != sorted(bid_prices, reverse=True) or ask_prices != sorted(ask_prices):
         raise FeedUnavailable(f"{prefix}: book prices are not in expected bid/ask order")
     best_bid, best_ask, bid1_qty, ask1_qty = bid_prices[0], ask_prices[0], bid_qty[0], ask_qty[0]
-    if best_ask < best_bid:
+    if best_ask <= best_bid:
         raise FeedUnavailable(f"{prefix}: crossed book ({best_bid} / {best_ask})")
     bid_depth, ask_depth = sum(bid_qty), sum(ask_qty)
     weighted_bid = sum(q * w for q, w in zip(bid_qty, WEIGHTS))
@@ -94,15 +108,16 @@ def _metrics(prefix: str, bid_prices: list[float], bid_qty: list[float],
 
 
 class ExcelRtdReader:
-    def __init__(self, workbook_name: str, sheet_name: str) -> None:
+    def __init__(self, workbook_name: str, sheet_name: str,
+                 extra_settings: ExtraSettings | None = None) -> None:
         self.workbook_name, self.sheet_name = workbook_name, sheet_name
         self._sheet: xw.Sheet | None = None
+        self.extra_settings = extra_settings or ExtraSettings()
 
     def _connect(self) -> xw.Sheet:
-        if xw is None:
-            raise FeedUnavailable("xlwings is not installed. Run: pip install -r requirements.txt")
+        excel = _load_xlwings()
         wanted = Path(self.workbook_name).name.lower()
-        for app in xw.apps:
+        for app in excel.apps:
             for book in app.books:
                 if Path(book.name).name.lower() == wanted:
                     try:
@@ -114,13 +129,19 @@ class ExcelRtdReader:
     def snapshot(self) -> dict[str, object]:
         try:
             self._sheet = self._sheet or self._connect()
+            # One COM transfer reduces (but cannot eliminate) asynchronous RTD skew.
+            block = self._sheet.range("C2:O11").options(ndim=2).value
+            if len(block) != 10 or any(len(values) != 13 for values in block):
+                raise FeedUnavailable("Unexpected C2:O11 shape")
             row: dict[str, object] = {"timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
-            for layout in LAYOUTS:
-                row[f"{layout.name.lower()}_trade_price"] = _numbers([self._sheet.range(layout.trade_price).value], f"{layout.name} trade price", expected_len=1)[0]
-                row.update(_metrics(layout.name.lower(), _column(self._sheet, layout.bid_prices, f"{layout.name} bid prices"),
-                                    _column(self._sheet, layout.bid_qty, f"{layout.name} bid quantities"),
-                                    _column(self._sheet, layout.ask_prices, f"{layout.name} ask prices"),
-                                    _column(self._sheet, layout.ask_qty, f"{layout.name} ask quantities")))
+            for name, offset in (("3y", 0), ("10y", 8)):
+                row[f"{name}_trade_price"] = _numbers([block[0][offset + 4]], f"{name} trade price", 1)[0]
+                row.update(_metrics(name, [values[offset + 1] for values in block[5:]],
+                                    [values[offset + 2] for values in block[5:]],
+                                    [values[offset + 1] for values in block[:5]],
+                                    [values[offset] for values in block[:5]]))
+            row.update(self._extra_snapshot())
+            row.update(market_metrics(row))
             return row
         except Exception as exc:
             self._sheet = None
@@ -128,72 +149,178 @@ class ExcelRtdReader:
                 raise
             raise FeedUnavailable(f"Excel read failed: {exc}") from exc
 
+    @staticmethod
+    def _cell_parts(address: str) -> tuple[int, int]:
+        match = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]*)", address)
+        if not match:
+            raise FeedUnavailable(f"Invalid extra RTD cell: {address}")
+        column = 0
+        for char in match.group(1):
+            column = column * 26 + ord(char) - 64
+        return int(match.group(2)), column
+
+    @staticmethod
+    def _cell_address(row: int, column: int) -> str:
+        letters = ""
+        while column:
+            column, remainder = divmod(column - 1, 26)
+            letters = chr(65 + remainder) + letters
+        return f"{letters}{row}"
+
+    def _extra_snapshot(self) -> dict[str, object]:
+        groups: dict[str, list[tuple[str, object]]] = {}
+        for key, binding in self.extra_settings.bindings.items():
+            if binding is not None:
+                groups.setdefault(binding.sheet, []).append((key, binding))
+        result: dict[str, object] = {}
+        numeric = {"cash_3y_yield_pct", "cash_10y_yield_pct", "3y_foreign_buy", "3y_foreign_sell",
+                   "10y_foreign_buy", "10y_foreign_sell", "3y_futures_yield_pct", "10y_futures_yield_pct"}
+        for sheet_name, bindings in groups.items():
+            sheet = self._sheet if sheet_name == self.sheet_name else self._sheet.book.sheets[sheet_name]
+            positions = {key: self._cell_parts(binding.cell) for key, binding in bindings}
+            rows, columns = zip(*positions.values())
+            top, bottom, left, right = min(rows), max(rows), min(columns), max(columns)
+            address = f"{self._cell_address(top, left)}:{self._cell_address(bottom, right)}"
+            values = sheet.range(address).options(ndim=2).value
+            if not isinstance(values, list):
+                values = [[values]]
+            for key, (row_number, column_number) in positions.items():
+                value = values[row_number - top][column_number - left]
+                if key in numeric:
+                    if value in (None, ""):
+                        result[key] = ""
+                        continue
+                    if isinstance(value, bool):
+                        raise FeedUnavailable(f"{key}: boolean RTD value")
+                    number = float(value)
+                    minimum = 0 if "foreign" in key else 1e-12
+                    if not math.isfinite(number) or number < minimum:
+                        raise FeedUnavailable(f"{key}: invalid RTD value {value!r}")
+                    result[key] = number
+                else:
+                    result[key] = "" if value is None else str(value).strip()
+        return result
+
 
 class SnapshotLogger:
-    def __init__(self, output_dir: Path, csv_enabled: bool, sqlite_enabled: bool) -> None:
+    def __init__(self, output_dir: Path, csv_enabled: bool, sqlite_enabled: bool,
+                 flush_interval: float = 1.0, file_stem: str = "snapshots_with_trades") -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.csv_path = output_dir / "snapshots.csv"
-        db_name = "snapshots.sqlite"
-        if self.csv_path.exists() and self.csv_path.stat().st_size > 0:
-            first_line = self.csv_path.open("r", encoding="utf-8").readline()
-            if "3y_trade_price" not in first_line:
-                self.csv_path = output_dir / "snapshots_with_trades.csv"
-                db_name = "snapshots_with_trades.sqlite"
+        if not re.fullmatch(r"[a-z0-9_]+", file_stem):
+            raise ValueError("Invalid output file stem")
+        self.csv_path = output_dir / f"{file_stem}.csv"
+        db_name = f"{file_stem}.sqlite"
         self.csv_enabled, self.sqlite_enabled = csv_enabled, sqlite_enabled
         self._header_written = self.csv_path.exists() and self.csv_path.stat().st_size > 0
         self.db = sqlite3.connect(output_dir / db_name) if sqlite_enabled else None
+        if self.db:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+        self.flush_interval = flush_interval
+        self._last_flush = time.monotonic()
+        self._csv_handle = None
+        self._csv_writer = None
+        self._db_insert_sql: str | None = None
+        self._columns: list[str] | None = None
+        self._dirty = False
 
     def write(self, row: dict[str, object]) -> None:
+        columns = list(row)
+        if any(not column.replace("_", "").isalnum() for column in columns):
+            raise ValueError("Invalid snapshot column identifier")
+        if self._columns is not None and columns != self._columns:
+            raise ValueError("Snapshot schema changed during collection")
+        if self._columns is None:
+            if self.csv_enabled and self._header_written:
+                with self.csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                    if next(csv.reader(handle)) != columns:
+                        raise ValueError("Existing CSV schema mismatch; use a new output directory")
+                with self.csv_path.open("rb") as handle:
+                    handle.seek(-1, 2)
+                    if handle.read(1) != b"\n":
+                        raise ValueError("Existing CSV ends in a partial row; preserve and repair separately")
+            if self.db:
+                existing = [item[1] for item in self.db.execute("PRAGMA table_info(snapshots)")]
+                if existing and existing != columns:
+                    raise ValueError("Existing SQLite schema mismatch; use a new output directory")
+            self._columns = columns
         if self.csv_enabled:
-            with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(row))
-                if not self._header_written:
-                    writer.writeheader(); self._header_written = True
-                writer.writerow(row)
+            if self._csv_handle is None:
+                self._csv_handle = self.csv_path.open("a", newline="", encoding="utf-8")
+                self._csv_writer = csv.DictWriter(self._csv_handle, fieldnames=list(row))
+            if not self._header_written:
+                self._csv_writer.writeheader(); self._header_written = True
+            self._csv_writer.writerow(row)
         if self.db:
-            columns = list(row)
-            definitions = ", ".join('"' + column + '" TEXT' for column in columns)
-            identifiers = ", ".join('"' + column + '"' for column in columns)
-            placeholders = ", ".join("?" for _ in columns)
-            self.db.execute(f"CREATE TABLE IF NOT EXISTS snapshots ({definitions})")
-            self.db.execute(f"INSERT INTO snapshots ({identifiers}) VALUES ({placeholders})", [str(row[c]) for c in columns])
+            if self._db_insert_sql is None:
+                self._columns = list(row)
+                definitions = ", ".join('"' + column + '" TEXT' for column in self._columns)
+                identifiers = ", ".join('"' + column + '"' for column in self._columns)
+                placeholders = ", ".join("?" for _ in self._columns)
+                self.db.execute(f"CREATE TABLE IF NOT EXISTS snapshots ({definitions})")
+                self._db_insert_sql = f"INSERT INTO snapshots ({identifiers}) VALUES ({placeholders})"
+            self.db.execute(self._db_insert_sql, [str(row[c]) for c in self._columns])
+        self._dirty = True
+        self.flush()
+
+    def flush(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not self._dirty or (not force and now - self._last_flush < self.flush_interval):
+            return
+        if self._csv_handle:
+            self._csv_handle.flush()
+        if self.db:
             self.db.commit()
+        self._last_flush = now
+        self._dirty = False
 
     def close(self) -> None:
+        self.flush(force=True)
+        if self._csv_handle:
+            self._csv_handle.close()
         if self.db:
             self.db.close()
 
 
+class SnapshotThrottle:
+    """Persist market changes immediately and unchanged heartbeats only occasionally."""
+
+    def __init__(self, heartbeat_seconds: float = 5.0) -> None:
+        self.heartbeat_seconds = heartbeat_seconds
+        self._signature: tuple[tuple[str, object], ...] | None = None
+        self._last_write = 0.0
+
+    def should_write(self, row: dict[str, object], now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        signature = tuple((key, value) for key, value in row.items() if key != "timestamp_utc")
+        changed = signature != self._signature
+        heartbeat_due = now - self._last_write >= self.heartbeat_seconds
+        if changed or heartbeat_due:
+            self._signature = signature
+            self._last_write = now
+            return True
+        return False
+
+
 class RollingRV:
     """In-memory relative-value display state; does not alter persisted rows."""
-    def __init__(self, window: int = 120, beta: float = 2.88) -> None:
+    def __init__(self, window: int = 120, beta: float = 2.88, min_samples: int | None = None) -> None:
         self.window, self.beta = window, beta
-        self.previous: tuple[float, float] | None = None
-        self.changes: list[float] = []
-        self.levels: list[float] = []
+        self.min_samples = window if min_samples is None else min_samples
+        self.analyzer = RollingRVAnalyzer(window, beta, self.min_samples)
+        self.session_date = None
 
-    def update(self, row: dict[str, object]) -> tuple[float, float, float, int] | None:
-        current = (float(row["3y_mid"]), float(row["10y_mid"]))
-        level = current[1] - self.beta * current[0]
-        if self.previous is None:
-            self.previous = current
-            self.levels.append(level)
-            return None
-        if current == self.previous:
-            return None
-        change = (current[1] - self.previous[1]) - self.beta * (current[0] - self.previous[0])
-        self.previous = current
-        self.changes.append(change)
-        self.levels.append(level)
-        sample = self.levels[-self.window:]
-        mean = statistics.fmean(sample)
-        stdev = statistics.stdev(sample) if len(sample) >= 2 else 0.0
-        zscore = ((level - mean) / stdev
-                  if len(sample) >= 20 and stdev > 1e-12 else 0.0)
-        return change, mean, zscore, len(sample)
+    def update(self, row: dict[str, object]) -> tuple[float, float, float, int, int] | None:
+        date = timestamp_kst(row["timestamp_utc"]).date()
+        if date != self.session_date:
+            self.analyzer.reset()
+        self.session_date = date
+        result = self.analyzer.update(row)
+        return (result["latest_rv_change"], result["level_mean"], result["zscore"],
+                result["samples"], self.min_samples) if result else None
 
 
-def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, float, int] | None = None,
+def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, float, int, int] | None = None,
             clear_screen: bool = True) -> None:
     if clear_screen:
         print("\033[2J\033[H", end="")
@@ -204,7 +331,7 @@ def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, fl
         print(f"     OBI {row[name+'_obi']:+.3f}  WOBI {row[name+'_weighted_obi']:+.3f}  "
               f"micro {row[name+'_microprice']:.4f}  depth B/A {row[name+'_bid_depth']:.0f}/{row[name+'_ask_depth']:.0f}")
     if rv is not None:
-        print(f"RV level z-score {rv[2]:+.3f}  |  samples {rv[3]}/20  |  latest Δ {rv[0]:+.6f}")
+        print(f"RV level z-score {rv[2]:+.3f}  |  samples {rv[3]}/{rv[4]}  |  latest Δ {rv[0]:+.6f}")
     else:
         print("RV warming up (waiting for a second snapshot)")
     print("Ctrl+C to stop. Data collection only; no order functionality is present.")
@@ -214,23 +341,47 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="KTB Excel RTD snapshot collector (no trading).")
     parser.add_argument("--workbook", default="국채선물 호가창.xlsx")
     parser.add_argument("--sheet", default="Sheet1")
+    parser.add_argument("--extra-settings", type=Path, default=Path("extra_settings.json"))
     parser.add_argument("--interval-ms", type=int, default=250, choices=range(100, 501))
     parser.add_argument("--output-dir", type=Path, default=Path("data"))
     parser.add_argument("--log", choices=("csv", "sqlite", "both"), default="both")
+    parser.add_argument("--flush-ms", type=int, default=1000,
+                        help="Flush CSV/SQLite writes in batches (default: 1000 ms)")
+    parser.add_argument("--heartbeat-seconds", type=float, default=5.0,
+                        help="Write an unchanged-book heartbeat this often (default: 5 seconds)")
+    parser.add_argument("--log-all", action="store_true", help="Persist every poll, including duplicates")
+    parser.add_argument("--quiet", action="store_true", help="Do not print every snapshot")
     parser.add_argument("--no-clear", action="store_true", help="Do not emit ANSI screen-clear codes")
     args = parser.parse_args()
-    reader = ExcelRtdReader(args.workbook, args.sheet)
-    logger = SnapshotLogger(args.output_dir, args.log in ("csv", "both"), args.log in ("sqlite", "both"))
+    if args.flush_ms < 100: parser.error("--flush-ms must be at least 100")
+    if not math.isfinite(args.heartbeat_seconds) or args.heartbeat_seconds <= 0:
+        parser.error("--heartbeat-seconds must be finite and positive")
+    extra_settings = load_extra_settings(args.extra_settings)
+    reader = ExcelRtdReader(args.workbook, args.sheet, extra_settings)
+    enhanced = any(binding is not None for binding in extra_settings.bindings.values())
+    logger = SnapshotLogger(args.output_dir, args.log in ("csv", "both"), args.log in ("sqlite", "both"),
+                            flush_interval=args.flush_ms / 1000,
+                            file_stem="snapshots_enhanced" if enhanced else "snapshots_with_trades")
+    throttle = SnapshotThrottle(args.heartbeat_seconds)
     rv_state = RollingRV()
     last_error: str | None = None
     try:
         while True:
             started = time.perf_counter()
             try:
-                row = reader.snapshot(); logger.write(row); display(row, args.interval_ms, rv_state.update(row), not args.no_clear); last_error = None
+                row = reader.snapshot()
+                rv = None if args.quiet else rv_state.update(row)
+                if args.log_all or throttle.should_write(row):
+                    logger.write(row)
+                logger.flush()
+                if not args.quiet:
+                    display(row, args.interval_ms, rv, not args.no_clear)
+                last_error = None
             except FeedUnavailable as exc:
                 if str(exc) != last_error:
                     print(f"[waiting for Excel] {exc}", file=sys.stderr); last_error = str(exc)
+            finally:
+                logger.flush()
             time.sleep(max(0.0, args.interval_ms / 1000 - (time.perf_counter() - started)))
     except KeyboardInterrupt:
         print("\nStopped.")

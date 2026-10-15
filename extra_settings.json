@@ -1,0 +1,31 @@
+{
+  "bindings": {
+    "cash_3y_yield_pct": {"sheet": "추가RTD", "cell": "B1"},
+    "cash_10y_yield_pct": {"sheet": "추가RTD", "cell": "B2"},
+    "cash_3y_time": null,
+    "cash_10y_time": null,
+    "3y_foreign_buy": {"sheet": "추가RTD", "cell": "B3"},
+    "3y_foreign_sell": {"sheet": "추가RTD", "cell": "B4"},
+    "10y_foreign_buy": {"sheet": "추가RTD", "cell": "B7"},
+    "10y_foreign_sell": {"sheet": "추가RTD", "cell": "B8"},
+    "3y_futures_yield_pct": {"sheet": "추가RTD", "cell": "B6"},
+    "10y_futures_yield_pct": {"sheet": "추가RTD", "cell": "B10"},
+    "3y_trade_time": null,
+    "10y_trade_time": null,
+    "3y_foreign_time": null,
+    "10y_foreign_time": null,
+    "session_id": null,
+    "3y_contract": null,
+    "10y_contract": null,
+    "cash_3y_bond": null,
+    "cash_10y_bond": null
+  },
+  "rules": [],
+  "sound_enabled": true,
+  "sound_gain": 0.06,
+  "stale_seconds": 10,
+  "max_source_age_seconds": 30,
+  "max_leg_skew_seconds": 10,
+  "flow_max_gap_seconds": 10,
+  "price_bin_points": 0.02
+}

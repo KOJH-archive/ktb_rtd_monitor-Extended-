@@ -9,6 +9,6 @@ if not exist ".venv32\Scripts\python.exe" (
     exit /b 1
 )
 
-".venv32\Scripts\python.exe" ".\analyze_snapshots.py" ".\data\snapshots.csv" --window 120 --beta 2.88
+".venv32\Scripts\python.exe" ".\analyze_snapshots.py" ".\data\snapshots_with_trades.csv" --settings ".\settings.json"
 echo.
 pause
