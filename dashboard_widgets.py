@@ -146,8 +146,9 @@ def build_dashboard(view):
     row_label(vol, "합성 RV = 10Y mid − β × 3Y mid\n가격 수준의 Z-score와 별도로 계산합니다.", size=9, color=MUTED)
     sizing = panel(risk_page, "02  위험예산 · 수량", "현재 구현 상태")
     sizing.grid(row=0, column=1, sticky="nsew")
-    row_label(sizing, "목표 변동성 기반 수량 미구현", size=12, color=WARN, bold=True)
-    row_label(sizing, "일간 패키지 손익 이력·위험예산이 필요합니다.\n아래 DV01은 헤지 비율과 가상 패키지 한도입니다.", size=9, color=MUTED)
+    view.sizing = row_label(sizing, "일별 현물금리·위험예산 입력 대기", size=11, color=WARN, bold=True)
+    row_label(sizing, "현물금리 변화와 입력 DV01로 만든 연구용 손익 대용치입니다.\n"
+              "선물 실현손익·운용 권장 수량으로 사용하지 않습니다.", size=9, color=MUTED)
     hedge = panel(risk_page, "03  DV01 헤지 · 한도")
     hedge.grid(row=1, column=0, columnspan=2, sticky="ew", pady=8)
     view.risk = row_label(hedge, view._risk_text(), size=10)
@@ -162,7 +163,8 @@ def build_dashboard(view):
     view.foreign_3y = row_label(flow, "3Y 외국인: 데이터 대기", size=11)
     tk.Frame(flow, bg=LINE, height=1).pack(fill="x", pady=10)
     view.foreign_10y = row_label(flow, "10Y 외국인: 데이터 대기", size=11)
-    row_label(flow, "관측 시작 이전 거래는 평균에 포함되지 않습니다. 실제 평균체결가·보유원가는 알 수 없습니다.", size=9, color=MUTED)
+    row_label(flow, "관측 시작 이전 거래는 평균에 포함되지 않습니다. 외국인별 체결·잔고 원천이 없어\n"
+              "실제 평균체결가·보유원가·미결제 포지션은 산출할 수 없습니다.", size=9, color=MUTED)
     market = panel(foreign_page, "데이터 연결 · 가격차")
     market.pack(fill="x", pady=10)
     view.market_spreads = row_label(market, "추가 RTD 대기", size=10)

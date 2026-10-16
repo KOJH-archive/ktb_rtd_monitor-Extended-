@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 
 data/
+기획팀/
 *.log
 *.sqlite
 *.db

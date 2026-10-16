@@ -3,7 +3,7 @@ import csv, json, math, os, tkinter as tk
 from collections import deque
 from time import perf_counter
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer, timestamp_kst
 from app_settings import AppSettings, effective_beta, load_settings
@@ -13,6 +13,7 @@ from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
                                market_metrics, metric_is_fresh, source_timestamp)
 from signal_engine import SignalEngine
 from curve_context import CashCurveTracker
+from cash_risk import load_cash_days, target_packages
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -112,6 +113,7 @@ class Dashboard(tk.Tk):
         self.fast_analyzer: RollingRVAnalyzer
         self.core_analyzer: MinuteRVAnalyzer
         self._reset_analyzers()
+        self.cash_risk_report = self._load_cash_risk()
         self.rejected_rows = 0
         self.decision_text = "중립/관찰"
         self.latest_row: dict[str, object] | None = None
@@ -189,6 +191,37 @@ class Dashboard(tk.Tk):
                 f"| 정수 패키지 {metrics['rounded_3y']}:{metrics['contracts_10y']} "
                 f"| 총 {metrics['gross_dv01']:,.0f}원/bp | 잔여 {metrics['residual_dv01']:,.0f}원/bp "
                 f"| {metrics['status']} | 분석 beta {effective_beta(self.settings):.4f}")
+
+    def _load_cash_risk(self) -> dict[str, object]:
+        source = self.settings.risk.cash_history_csv
+        if source is None:
+            return {"status": "missing_history"}
+        path = Path(source)
+        if not path.is_absolute():
+            path = Path(__file__).parent / path
+        try:
+            today_kst = timestamp_kst(datetime.now(timezone.utc)).date()
+            return target_packages(load_cash_days(path), self.settings.risk,
+                                   today_kst - timedelta(days=1))
+        except (OSError, ValueError) as exc:
+            return {"status": "invalid_history", "reason": str(exc)}
+
+    def _sizing_text(self) -> str:
+        report = getattr(self, "cash_risk_report", {"status": "missing_history"})
+        status = report["status"]
+        if status == "missing_history":
+            return "일별 현물금리 CSV 미연결 · settings.json의 risk.cash_history_csv 입력 필요"
+        if status == "missing_settings":
+            return "위험예산·DV01 입력 필요 · " + ", ".join(report["missing"])
+        if status == "insufficient_history":
+            return f"일별 위험 표본 {report['observations']}/{report['required']}개 · 수량 준비 중"
+        if status != "research_proxy":
+            return f"현물금리 위험 계산 불가 · {report.get('reason', status)}"
+        limits = "한도 일부 미설정" if not report["limits_complete"] else "설정 한도 반영"
+        return (f"현물금리 기반 연구 수량 {report['target_packages']}패키지 "
+                f"(10Y {report['contracts_10y']} / 3Y {report['contracts_3y']}) · {limits}\n"
+                f"기준 {report['as_of']} · 1패키지 일간 σ {report['unit_daily_sigma_krw']:,.0f}원 "
+                f"/ 목표 위험 {report['daily_budget_krw']:,.0f}원")
 
     def _flow_text(self) -> str:
         if not self.flow_result:
@@ -303,6 +336,7 @@ class Dashboard(tk.Tk):
             rendered = "—" if value is None else (f"{value:+.1f}" if key.endswith("_spread_bp")
                        else f"{value:.3f}")
             label.config(text=rendered, fg=INK if fresh else MUTED)
+        self.sizing.config(text=self._sizing_text())
         core = self.core_result or {}
         samples = int(core.get("minute_change_samples", 0))
         if core.get("minute_change_ready"):

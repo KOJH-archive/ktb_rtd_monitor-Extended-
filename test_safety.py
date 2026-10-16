@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from types import MethodType, SimpleNamespace
 
 from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer
+from cash_risk import CashDay, _changes, load_cash_days, oos_check, target_packages
 from curve_context import CashCurveTracker
 from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, load_settings
 from dashboard import Dashboard, IncrementalCsvTail
@@ -44,14 +45,14 @@ class SafetyTests(unittest.TestCase):
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
                                                                "futures_yield_spread_bp", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_decision_text", "_flow_text", "_basis_text", "_cost_text",
-                       "_market_text", "_foreign_text", "_curve_text", "_render_overview",
+                       "_market_text", "_foreign_text", "_curve_text", "_sizing_text", "_render_overview",
                        "_clear_market_display", "refresh"):
             setattr(view, method, MethodType(getattr(Dashboard, method), view))
         view._rv_text = Dashboard._rv_text
         view._reset_analyzers()
         for name in ("status", "decision", "fast_rv", "core_rv", "flow", "basis", "cost",
                      "market_spreads", "foreign_3y", "foreign_10y", "alert_status", "volatility",
-                     "window_note", "curve_position", "curve_trend"):
+                     "window_note", "curve_position", "curve_trend", "sizing"):
             setattr(view, name, MagicMock())
         view.labels = {(name, key): MagicMock() for name in ("3y", "10y") for key in
                        ("mid", "spread", "obi", "weighted_obi", "microprice", "bid_depth", "ask_depth")}
@@ -276,6 +277,51 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("확대 동행", trend)
         curve.update({**row, "cash_10y_yield_pct": ""})
         self.assertIsNone(curve.summary())
+
+    def test_cash_risk_proxy_uses_dv01_and_never_future_data_for_sizing(self):
+        from datetime import date
+        points = [CashDay(date(2024, 1, 1) + timedelta(days=i), 300.0,
+                          330.0 + (i % 5) * .1) for i in range(80)]
+        risk = RiskSettings(dv01_3y_krw_per_bp=30_000, dv01_10y_krw_per_bp=90_000,
+                            capital_krw=1_000_000_000, annual_target_vol_fraction=.1,
+                            max_package_count=4, max_gross_dv01_krw_per_bp=720_000,
+                            max_residual_dv01_krw_per_bp=1)
+        self.assertAlmostEqual(_changes(points[:2], risk)[0]["package_proxy_pnl_krw"], -9_000)
+        baseline = target_packages(points, risk, points[-1].day)
+        self.assertEqual(baseline["status"], "research_proxy")
+        self.assertLessEqual(baseline["target_packages"], 4)
+        self.assertLessEqual(target_packages(points, replace(risk, max_gross_dv01_krw_per_bp=360_000),
+                                             points[-1].day)["target_packages"], 2)
+        future = CashDay(points[-1].day + timedelta(days=1), 300.0, 900.0)
+        self.assertEqual(target_packages(points + [future], risk, points[-1].day), baseline)
+        self.assertEqual(target_packages(points, replace(risk, capital_krw=None), points[-1].day)
+                         ["status"], "missing_settings")
+
+    def test_cash_curve_oos_is_chronological_and_requires_long_history(self):
+        from datetime import date
+        points = [CashDay(date(2024, 1, 1) + timedelta(days=i), 300.0,
+                          330.0 + (i % 7) * .1) for i in range(340)]
+        cutoff = points[275].day
+        result = oos_check(points, cutoff)
+        self.assertEqual(result["status"], "evaluated")
+        self.assertEqual(result["train_days"], 274)
+        self.assertEqual(result["test_days"], 65)
+        self.assertEqual(oos_check(points[:200], cutoff)["status"], "insufficient_history")
+        self.assertGreater(result["first_test_forecast_sigma_bp"], 0)
+        changed_future = points[:275] + [CashDay(item.day, item.three_bp, item.ten_bp + 30)
+                                          for item in points[275:]]
+        self.assertEqual(oos_check(changed_future, cutoff)["first_test_forecast_sigma_bp"],
+                         result["first_test_forecast_sigma_bp"])
+
+    def test_cash_daily_loader_rejects_duplicate_dates(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            path = Path(folder) / "cash.csv"
+            path.write_text("date,cash_3y_yield_pct,cash_10y_yield_pct\n"
+                            "2024-01-02,3.0,3.3\n2024-01-03,3.1,3.4\n", encoding="utf-8")
+            self.assertAlmostEqual(load_cash_days(path)[-1].spread_bp, 30.0)
+            path.write_text(path.read_text(encoding="utf-8") + "2024-01-03,3.1,3.4\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_cash_days(path)
 
     def test_quiet_sound_is_short_and_valid_wav(self):
         sound = WindowsNotifier._wav(.06)

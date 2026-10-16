@@ -24,6 +24,10 @@ class RiskSettings:
     package_10y_contracts: int = 1
     max_gross_dv01_krw_per_bp: float | None = None
     max_residual_dv01_krw_per_bp: float | None = None
+    capital_krw: float | None = None
+    annual_target_vol_fraction: float | None = None
+    max_package_count: int | None = None
+    cash_history_csv: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,9 +133,19 @@ def load_settings(path: Path) -> AppSettings:
                                       "risk.package_10y_contracts", minimum=1),
         max_gross_dv01_krw_per_bp=optional_positive("max_gross_dv01_krw_per_bp"),
         max_residual_dv01_krw_per_bp=optional_positive("max_residual_dv01_krw_per_bp"),
+        capital_krw=optional_positive("capital_krw"),
+        annual_target_vol_fraction=optional_positive("annual_target_vol_fraction"),
+        max_package_count=(None if risk_raw.get("max_package_count") is None else
+                           _integer(risk_raw["max_package_count"], "risk.max_package_count", minimum=1)),
+        cash_history_csv=risk_raw.get("cash_history_csv"),
     )
     if (risk.dv01_3y_krw_per_bp is None) != (risk.dv01_10y_krw_per_bp is None):
         raise ValueError("Both 3Y and 10Y DV01 values must be supplied together")
+    if (risk.annual_target_vol_fraction is not None and risk.annual_target_vol_fraction > 1):
+        raise ValueError("risk.annual_target_vol_fraction must not exceed 1")
+    if risk.cash_history_csv is not None and (not isinstance(risk.cash_history_csv, str)
+                                              or not risk.cash_history_csv.strip()):
+        raise ValueError("risk.cash_history_csv must be a nonempty path")
 
     flow = FlowSettings(
         ema_alpha=_positive(flow_raw.get("ema_alpha", defaults.flow.ema_alpha), "flow.ema_alpha"),

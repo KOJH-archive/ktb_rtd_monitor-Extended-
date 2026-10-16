@@ -16,7 +16,11 @@
     "dv01_10y_krw_per_bp": null,
     "package_10y_contracts": 1,
     "max_gross_dv01_krw_per_bp": null,
-    "max_residual_dv01_krw_per_bp": null
+    "max_residual_dv01_krw_per_bp": null,
+    "capital_krw": null,
+    "annual_target_vol_fraction": null,
+    "max_package_count": null,
+    "cash_history_csv": "data/cash_daily.csv"
   },
   "flow": {
     "ema_alpha": 0.2,
