@@ -119,6 +119,7 @@ class Dashboard(tk.Tk):
         self.flow_result: dict[str, object] | None = None
         self.pending_rows = deque()
         self.replaying = False
+        self.alert_popup = None
         build_dashboard(self)
         self.after(500, self.refresh)
 
@@ -147,6 +148,35 @@ class Dashboard(tk.Tk):
         self.alert_engine = AlertEngine(self.extra_settings.rules)
         self.notifier = WindowsNotifier(self.extra_settings)
         self.alert_status.config(text=self._alert_summary(), fg=ACCENT)
+
+    def show_alert_popup(self, event) -> None:
+        """Show a visible, non-modal alert without stealing input focus."""
+        if self.alert_popup is not None and self.alert_popup.winfo_exists():
+            self.alert_popup.destroy()
+        popup = tk.Toplevel(self)
+        self.alert_popup = popup
+        popup.title("KTB 가격 알림")
+        popup.configure(bg="#fff7df")
+        popup.resizable(False, False)
+        popup.attributes("-topmost", True)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        frame = tk.Frame(popup, bg="#fff7df", padx=18, pady=13)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text="KTB 가격 알림", bg="#fff7df", fg="#7a4300",
+                 font=("맑은 고딕", 12, "bold"), anchor="w").pack(fill="x")
+        tk.Label(frame, text=event.name, bg="#fff7df", fg="#241b10",
+                 font=("맑은 고딕", 11), anchor="w", justify="left", wraplength=330).pack(fill="x", pady=(5, 0))
+        tk.Label(frame, text=f"현재값  {event.value:+.3f}", bg="#fff7df", fg="#241b10",
+                 font=("Consolas", 15, "bold"), anchor="w").pack(fill="x", pady=(4, 8))
+        tk.Button(frame, text="닫기", command=popup.destroy, relief="flat",
+                  bg="#e6c76a", activebackground="#d7b453", fg="#241b10",
+                  font=("맑은 고딕", 9), padx=10).pack(anchor="e")
+        popup.update_idletasks()
+        width, height = popup.winfo_width(), popup.winfo_height()
+        x = popup.winfo_screenwidth() - width - 28
+        y = popup.winfo_screenheight() - height - 70
+        popup.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+        popup.after(8000, lambda: popup.destroy() if popup.winfo_exists() else None)
 
     def _risk_text(self) -> str:
         metrics = risk_metrics(self.settings.risk)
@@ -307,6 +337,7 @@ class Dashboard(tk.Tk):
             if alert_events:
                 last = alert_events[-1]
                 self.notifier.notify(self.winfo_id())
+                self.show_alert_popup(last)
                 self.alert_status.config(text=f"알림: {last.name} | {last.value:+.3f}", fg=WARN)
             if self.latest_row:
                 row = self.latest_row

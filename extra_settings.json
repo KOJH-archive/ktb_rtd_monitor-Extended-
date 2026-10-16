@@ -66,6 +66,28 @@
       "confirmation_seconds": 1,
       "cooldown_seconds": 60,
       "enabled": true
+    },
+    {
+      "name": "10년−3년 선물 체결가차 (pt) 이상 29.4",
+      "metric": "futures_spread",
+      "mode": "above",
+      "lower": 29.4,
+      "upper": null,
+      "hysteresis": 0.01,
+      "confirmation_seconds": 1,
+      "cooldown_seconds": 60,
+      "enabled": true
+    },
+    {
+      "name": "10년−3년 선물 체결가차 (pt) 이하 25.5",
+      "metric": "futures_spread",
+      "mode": "below",
+      "lower": 25.5,
+      "upper": null,
+      "hysteresis": 0.01,
+      "confirmation_seconds": 1,
+      "cooldown_seconds": 60,
+      "enabled": true
     }
   ],
   "sound_enabled": true,

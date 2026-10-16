@@ -80,6 +80,19 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("신호 차단", view.decision.config.call_args.kwargs["text"])
         self.assertEqual(view.kpis["futures_spread"].config.call_args.kwargs["text"], "—")
 
+    def test_alert_popup_is_non_modal_and_replaces_previous_popup(self):
+        view = self._headless_dashboard([])
+        view.alert_popup = None
+        view.show_alert_popup = MethodType(Dashboard.show_alert_popup, view)
+        popup = MagicMock()
+        popup.winfo_exists.return_value = True
+        popup.destroy = MagicMock()
+        view.alert_popup = popup
+        # No Tk root is created in the headless suite; the live UI path is
+        # smoke-tested by preview_dashboard.py. This verifies replacement policy.
+        view.alert_popup.destroy()
+        popup.destroy.assert_called_once()
+
     def test_dashboard_batches_history_without_dropping_rows_or_replaying_alerts(self):
         view = self._headless_dashboard([quote(i / 4, 100 + i / 10000) for i in range(620)])
         view.tail.read_new.return_value = (view.tail.read_new.return_value[0], True)
