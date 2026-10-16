@@ -42,7 +42,7 @@ class SafetyTests(unittest.TestCase):
                                tail=MagicMock(), after=MagicMock(), winfo_id=MagicMock(return_value=1),
                                pending_rows=deque(), replaying=False, kpis={
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
-                                                               "futures_spread", "cash_spread_bp")})
+                                                               "futures_yield_spread_bp", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_decision_text", "_flow_text", "_basis_text", "_cost_text",
                        "_market_text", "_foreign_text", "_curve_text", "_render_overview",
                        "_clear_market_display", "refresh"):
@@ -92,7 +92,7 @@ class SafetyTests(unittest.TestCase):
             view.refresh()
         self.assertIsNone(view.latest_row)
         self.assertIn("신호 차단", view.decision.config.call_args.kwargs["text"])
-        self.assertEqual(view.kpis["futures_spread"].config.call_args.kwargs["text"], "—")
+        self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "—")
 
     def test_alert_popup_is_non_modal_and_replaces_previous_popup(self):
         view = self._headless_dashboard([])
@@ -169,9 +169,16 @@ class SafetyTests(unittest.TestCase):
         settings = parse_settings(raw)
         self.assertEqual(settings.bindings["cash_3y_yield_pct"].cell, "B1")
         metrics = market_metrics({"3y_trade_price": 102.95, "10y_trade_price": 106.30,
-                                  "cash_3y_yield_pct": 3.861, "cash_10y_yield_pct": 4.188})
+                                  "cash_3y_yield_pct": 3.861, "cash_10y_yield_pct": 4.188,
+                                  "3y_futures_yield_pct": 3.934, "10y_futures_yield_pct": 4.221})
         self.assertAlmostEqual(metrics["futures_spread"], 3.35)
         self.assertAlmostEqual(metrics["cash_spread_bp"], 32.7)
+        self.assertAlmostEqual(metrics["futures_yield_spread_bp"], 28.7)
+        self.assertNotIn("futures_yield_spread_bp", market_metrics({"3y_futures_yield_pct": 3.934}))
+        view = self._headless_dashboard([])
+        view._render_overview({"3y_futures_yield_pct": 3.934,
+                               "10y_futures_yield_pct": 4.221}, True)
+        self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "+28.7")
         with self.assertRaises(ValueError):
             parse_settings({"bindings": {"cash_3y_yield_pct": {"sheet": "x", "cell": "B0"}}})
 

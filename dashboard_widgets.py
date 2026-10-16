@@ -109,7 +109,7 @@ def build_dashboard(view):
     view.kpis = {}
     definitions = (("3y_trade_price", "3년 선물", "최근 체결가 · pt"),
                    ("10y_trade_price", "10년 선물", "최근 체결가 · pt"),
-                   ("futures_spread", "선물 가격차", "10년 − 3년 · pt"),
+                   ("futures_yield_spread_bp", "선물 수익률 차", "10년 − 3년 · bp"),
                    ("cash_spread_bp", "현물 금리차", "10년 − 3년 · bp"))
     for column, (key, title, unit) in enumerate(definitions):
         cards.columnconfigure(column, weight=1, uniform="kpi")

@@ -300,8 +300,8 @@ class Dashboard(tk.Tk):
         metrics = market_metrics(row) if row else {}
         for key, label in self.kpis.items():
             value = metrics.get(key)
-            rendered = "—" if value is None else (f"{value:+.1f}" if key == "cash_spread_bp"
-                       else f"{value:+.3f}" if key == "futures_spread" else f"{value:.3f}")
+            rendered = "—" if value is None else (f"{value:+.1f}" if key.endswith("_spread_bp")
+                       else f"{value:.3f}")
             label.config(text=rendered, fg=INK if fresh else MUTED)
         core = self.core_result or {}
         samples = int(core.get("minute_change_samples", 0))

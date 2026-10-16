@@ -32,6 +32,8 @@ def market_metrics(row: dict[str, object]) -> dict[str, float]:
     price10 = optional_number(row.get("10y_trade_price"))
     cash3 = optional_number(row.get("cash_3y_yield_pct"))
     cash10 = optional_number(row.get("cash_10y_yield_pct"))
+    futures_yield3 = optional_number(row.get("3y_futures_yield_pct"))
+    futures_yield10 = optional_number(row.get("10y_futures_yield_pct"))
     if price3 is not None:
         result["3y_trade_price"] = price3
     if price10 is not None:
@@ -40,6 +42,8 @@ def market_metrics(row: dict[str, object]) -> dict[str, float]:
         result["futures_spread"] = price10 - price3
     if cash3 is not None and cash10 is not None:
         result["cash_spread_bp"] = (cash10 - cash3) * 100.0
+    if futures_yield3 is not None and futures_yield10 is not None:
+        result["futures_yield_spread_bp"] = (futures_yield10 - futures_yield3) * 100.0
     return result
 
 
