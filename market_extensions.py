@@ -7,6 +7,7 @@ import math
 import struct
 import threading
 import wave
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -233,6 +234,66 @@ class _Side:
         return result
 
 
+@dataclass
+class _FlowSecond:
+    timestamp: datetime
+    first_price: float
+    last_price: float
+    buy: float = 0.0
+    sell: float = 0.0
+    buy_price_value: float = 0.0
+    sell_price_value: float = 0.0
+
+
+class _RollingForeignWindow:
+    """Second-bucketed rolling totals; bounded to one session hour."""
+
+    def __init__(self, minutes: int) -> None:
+        self.minutes = minutes
+        self.buckets: deque[_FlowSecond] = deque()
+        self.buy = self.sell = self.buy_price_value = self.sell_price_value = 0.0
+
+    def add(self, timestamp: datetime, buy: float, sell: float, price: float) -> None:
+        second = timestamp.replace(microsecond=0)
+        if not self.buckets or self.buckets[-1].timestamp != second:
+            self.buckets.append(_FlowSecond(second, price, price))
+        bucket = self.buckets[-1]
+        bucket.last_price = price
+        bucket.buy += buy
+        bucket.sell += sell
+        bucket.buy_price_value += buy * price
+        bucket.sell_price_value += sell * price
+        self.buy += buy
+        self.sell += sell
+        self.buy_price_value += buy * price
+        self.sell_price_value += sell * price
+        cutoff = timestamp - timedelta(minutes=self.minutes)
+        while self.buckets and self.buckets[0].timestamp < cutoff:
+            old = self.buckets.popleft()
+            self.buy -= old.buy
+            self.sell -= old.sell
+            self.buy_price_value -= old.buy_price_value
+            self.sell_price_value -= old.sell_price_value
+
+    def summary(self, timestamp: datetime, started: datetime) -> dict[str, object]:
+        elapsed = max(0.0, (timestamp - started).total_seconds())
+        window_seconds = self.minutes * 60
+        buy = max(0.0, self.buy)
+        sell = max(0.0, self.sell)
+        return {
+            "minutes": self.minutes,
+            "complete": elapsed >= window_seconds,
+            "observed_seconds": min(elapsed, window_seconds),
+            "buy_volume": buy,
+            "sell_volume": sell,
+            "net_volume": buy - sell,
+            "buy_avg_price": self.buy_price_value / buy if buy > 0 else None,
+            "sell_avg_price": self.sell_price_value / sell if sell > 0 else None,
+            "price_change": (self.buckets[-1].last_price - self.buckets[0].first_price)
+                            if self.buckets else None,
+        }
+
+
 class ForeignFlowTracker:
     """Estimate price/yield zones from changes in participant cumulative volumes.
 
@@ -244,15 +305,18 @@ class ForeignFlowTracker:
         self.contract, self.settings = contract, settings
         self.previous: tuple[float, float] | None = None
         self.previous_time: datetime | None = None
+        self.started_time: datetime | None = None
         self.session = None
         self.buy, self.sell = _Side(), _Side()
+        self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
         self.resets = 0
 
     def reset(self, buy: float | None = None, sell: float | None = None,
               timestamp: datetime | None = None, session=None) -> None:
         self.previous = (buy, sell) if buy is not None and sell is not None else None
-        self.previous_time, self.session = timestamp, session
+        self.previous_time, self.started_time, self.session = timestamp, timestamp, session
         self.buy, self.sell = _Side(), _Side()
+        self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
         self.resets += 1
 
     def update(self, row: dict[str, object], timestamp: datetime, session) -> None:
@@ -261,6 +325,7 @@ class ForeignFlowTracker:
         price = optional_number(row.get(f"{self.contract}_trade_price"))
         yield_pct = optional_number(row.get(f"{self.contract}_futures_yield_pct"))
         if buy is None or sell is None or price is None or min(buy, sell) < 0:
+            self.reset()
             return
         if (self.previous is None or session != self.session or self.previous_time is None
                 or timestamp <= self.previous_time
@@ -268,10 +333,17 @@ class ForeignFlowTracker:
                 or buy < self.previous[0] or sell < self.previous[1]):
             self.reset(buy, sell, timestamp, session)
             return
-        self.buy.add(buy - self.previous[0], price, yield_pct, self.settings.price_bin_points)
-        self.sell.add(sell - self.previous[1], price, yield_pct, self.settings.price_bin_points)
+        buy_change, sell_change = buy - self.previous[0], sell - self.previous[1]
+        self.buy.add(buy_change, price, yield_pct, self.settings.price_bin_points)
+        self.sell.add(sell_change, price, yield_pct, self.settings.price_bin_points)
+        for window in self.windows.values():
+            window.add(timestamp, buy_change, sell_change, price)
         self.previous, self.previous_time, self.session = (buy, sell), timestamp, session
 
     def summary(self) -> dict[str, object]:
+        windows = ({minutes: window.summary(self.previous_time, self.started_time)
+                    for minutes, window in self.windows.items()}
+                   if self.previous_time is not None and self.started_time is not None else {})
         return {"contract": self.contract, "buy": self.buy.summary(self.settings.price_bin_points),
-                "sell": self.sell.summary(self.settings.price_bin_points), "resets": self.resets}
+                "sell": self.sell.summary(self.settings.price_bin_points), "resets": self.resets,
+                "windows": windows}

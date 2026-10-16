@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from types import MethodType, SimpleNamespace
 
 from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer
+from curve_context import CashCurveTracker
 from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, load_settings
 from dashboard import Dashboard, IncrementalCsvTail
 from decision_support import OrderFlowAnalyzer, risk_metrics
@@ -43,12 +44,14 @@ class SafetyTests(unittest.TestCase):
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
                                                                "futures_spread", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_decision_text", "_flow_text", "_basis_text", "_cost_text",
-                       "_market_text", "_foreign_text", "_render_overview", "_clear_market_display", "refresh"):
+                       "_market_text", "_foreign_text", "_curve_text", "_render_overview",
+                       "_clear_market_display", "refresh"):
             setattr(view, method, MethodType(getattr(Dashboard, method), view))
         view._rv_text = Dashboard._rv_text
         view._reset_analyzers()
         for name in ("status", "decision", "fast_rv", "core_rv", "flow", "basis", "cost",
-                     "market_spreads", "foreign_3y", "foreign_10y", "alert_status", "volatility", "window_note"):
+                     "market_spreads", "foreign_3y", "foreign_10y", "alert_status", "volatility",
+                     "window_note", "curve_position", "curve_trend"):
             setattr(view, name, MagicMock())
         view.labels = {(name, key): MagicMock() for name in ("3y", "10y") for key in
                        ("mid", "spread", "obi", "weighted_obi", "microprice", "bid_depth", "ask_depth")}
@@ -69,6 +72,17 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(view.rejected_rows, 1)
         self.assertEqual(view.latest_row["timestamp_utc"], quote(5)["timestamp_utc"])
         self.assertEqual(view.fast_result["samples"], 1)
+
+    def test_stale_foreign_source_discards_rolling_history(self):
+        initial = {**quote(), "3y_trade_price": 105.0,
+                   "3y_foreign_buy": 100, "3y_foreign_sell": 100}
+        stale = {**quote(5), "3y_trade_price": 105.1,
+                 "3y_foreign_buy": 110, "3y_foreign_sell": 100,
+                 "3y_foreign_time": "2026-10-14T00:00:00+00:00"}
+        view = self._headless_dashboard([initial, stale])
+        with patch("dashboard.current_csv", return_value=Path("test.csv")):
+            view.refresh()
+        self.assertEqual(view.foreign_trackers["3y"].summary()["windows"], {})
 
     def test_dashboard_read_error_clears_cached_signal(self):
         view = self._headless_dashboard([])
@@ -199,6 +213,62 @@ class SafetyTests(unittest.TestCase):
         reset = {**second, "3y_foreign_buy": 5, "3y_foreign_sell": 4}
         tracker.update(reset, START + timedelta(seconds=6), START.date())
         self.assertIsNone(tracker.summary()["buy"])
+
+    def test_foreign_rolling_windows_exclude_old_flow_and_flag_partial_history(self):
+        tracker = ForeignFlowTracker("3y", ExtraSettings())
+        base = {**quote(), "3y_foreign_buy": 100, "3y_foreign_sell": 100,
+                "3y_trade_price": 105.0}
+        tracker.update(base, START, "session")
+        for step in range(1, 721):
+            row = dict(base)
+            row["3y_foreign_buy"] = 100 + (10 if step >= 1 else 0) + (20 if step >= 719 else 0)
+            row["3y_foreign_sell"] = 100 + (50 if step >= 599 else 0)
+            row["3y_trade_price"] = 105.0 if step < 600 else 105.5
+            tracker.update(row, START + timedelta(seconds=step * 5), "session")
+            if step == 60:
+                partial = tracker.summary()["windows"]
+                self.assertFalse(partial[15]["complete"])
+        windows = tracker.summary()["windows"]
+        self.assertTrue(windows[60]["complete"])
+        self.assertEqual(windows[5]["net_volume"], 20)
+        self.assertEqual(windows[15]["net_volume"], -30)
+        self.assertEqual(windows[60]["net_volume"], -20)
+        self.assertEqual(windows[5]["buy_avg_price"], 105.5)
+        self.assertIsNone(windows[5]["sell_avg_price"])
+        self.assertEqual(windows[15]["sell_avg_price"], 105.0)
+        self.assertLessEqual(len(tracker.windows[60].buckets), 3601)
+        view = self._headless_dashboard([])
+        view.foreign_trackers["3y"] = tracker
+        display = view._foreign_text("3y", row)
+        self.assertIn("최근 5분", display)
+        self.assertIn("최근 1분 수급 속도", display)
+        self.assertIn("가격 정체", display)
+        tracker.update({**row, "3y_foreign_buy": 2}, START + timedelta(seconds=3605), "session")
+        self.assertEqual(tracker.summary()["windows"][5]["net_volume"], 0)
+        tracker.update({**row, "3y_trade_price": ""}, START + timedelta(seconds=3610), "session")
+        self.assertEqual(tracker.summary()["windows"], {})
+
+    def test_cash_curve_uses_completed_minutes_and_resets_missing_feed(self):
+        curve = CashCurveTracker()
+        for minute in range(61):
+            row = {"timestamp_utc": (START + timedelta(minutes=minute)).isoformat(),
+                   "cash_3y_yield_pct": 3.0, "cash_10y_yield_pct": 3.30 + minute * .001}
+            curve.update(row)
+            if minute == 5:
+                self.assertIsNotNone(curve.summary()["location_5m"])
+                self.assertIsNone(curve.summary()["location_60m"])
+        summary = curve.summary()
+        self.assertAlmostEqual(summary["spread_bp"], 36.0)
+        self.assertAlmostEqual(summary["change_5m_bp"], .5)
+        self.assertAlmostEqual(summary["change_15m_bp"], 1.5)
+        self.assertIsNotNone(summary["location_60m"])
+        view = self._headless_dashboard([])
+        view.curve_tracker = curve
+        position, trend = view._curve_text()
+        self.assertIn("60분 평균", position)
+        self.assertIn("확대 동행", trend)
+        curve.update({**row, "cash_10y_yield_pct": ""})
+        self.assertIsNone(curve.summary())
 
     def test_quiet_sound_is_short_and_valid_wav(self):
         sound = WindowsNotifier._wav(.06)

@@ -126,9 +126,17 @@ def build_dashboard(view):
     notebook.pack(fill="both", expand=True)
     view.notebook = notebook
     pages = []
-    for title in ("변동성 · 위험", "외국인 수급", "호가 · 비용"):
+    for title in ("금리차 위치", "외국인 수급", "변동성 · 위험", "호가 · 비용"):
         pages.append(scroll_page(notebook, title))
-    risk_page, foreign_page, book_page = pages
+    curve_page, foreign_page, risk_page, book_page = pages
+
+    curve = panel(curve_page, "현물 10년 − 3년 금리차", "최근 체결수익률 차이 · bp · 수집시각 기준")
+    curve.pack(fill="x")
+    view.curve_position = row_label(curve, "현물 RTD 데이터 대기", size=11, color=ACCENT, bold=True)
+    view.curve_trend = row_label(curve, "5·15분 변화: 기준 데이터 대기", size=10)
+    row_label(curve, "5분·60분 위치는 완료된 각 분의 마지막 관측값과 비교합니다.\n"
+              "추세는 최근 변화 방향만 표시하며, 미래 방향이나 적정가를 예측하지 않습니다.",
+              size=9, color=MUTED)
 
     risk_page.columnconfigure(0, weight=1, uniform="risk")
     risk_page.columnconfigure(1, weight=1, uniform="risk")

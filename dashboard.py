@@ -12,6 +12,7 @@ from extra_settings import METRICS, AlertRule, load_extra_settings, parse_settin
 from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
                                market_metrics, metric_is_fresh, source_timestamp)
 from signal_engine import SignalEngine
+from curve_context import CashCurveTracker
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -135,6 +136,7 @@ class Dashboard(tk.Tk):
         self.alert_engine = AlertEngine(self.extra_settings.rules)
         self.notifier = WindowsNotifier(self.extra_settings)
         self.foreign_trackers = {name: ForeignFlowTracker(name, self.extra_settings) for name in ("3y", "10y")}
+        self.curve_tracker = CashCurveTracker()
 
     def _alert_summary(self) -> str:
         enabled = sum(rule.enabled for rule in self.extra_settings.rules)
@@ -240,7 +242,59 @@ class Dashboard(tk.Tk):
                 parts.append(f"{label} 추정 {item['estimated_avg_price']:.3f}{yld} "
                              f"| 주구간 {item['dominant_price_low']:.2f}~{item['dominant_price_high']:.2f} "
                              f"(관측증가 {item['observed_volume']:,.0f})")
-        return prefix + ("\n" + "\n".join(parts) if parts else " | 기준점 설정 중")
+        windows = summary["windows"]
+        recent = []
+        for minutes in (5, 15, 60):
+            item = windows.get(minutes)
+            if item is None:
+                continue
+            partial = "" if item["complete"] else f" (부분 {item['observed_seconds']/60:.1f}/{minutes}분)"
+            buy_price = "—" if item["buy_avg_price"] is None else f"{item['buy_avg_price']:.3f}"
+            sell_price = "—" if item["sell_avg_price"] is None else f"{item['sell_avg_price']:.3f}"
+            recent.append(f"최근 {minutes}분{partial}: 순매수 {item['net_volume']:+,.0f}계약 "
+                          f"| 매수 추정가 {buy_price} / 매도 추정가 {sell_price}")
+        pace = windows.get(1)
+        if pace:
+            recent.append((f"최근 1분 수급 속도 {pace['net_volume']:+,.0f}계약/분"
+                           if pace["complete"] else "최근 1분 수급 속도 준비 중"))
+        five = windows.get(5)
+        if five and five["complete"] and five["price_change"] is not None:
+            net, change = five["net_volume"], five["price_change"]
+            if abs(net) < 1e-9:
+                response = "순매수 중립"
+            elif abs(change) < 1e-9:
+                response = "수급 증가 대비 가격 정체"
+            elif net * change < 0:
+                response = "수급·가격 방향 엇갈림"
+            else:
+                response = "수급·가격 같은 방향"
+            recent.append(f"최근 5분 체결가 변화 {change:+.3f}pt | {response} (인과관계 아님)")
+        return (prefix + ("\n" + "\n".join(parts) if parts else " | 기준점 설정 중")
+                + ("\n" + "\n".join(recent) if recent else ""))
+
+    def _curve_text(self) -> tuple[str, str]:
+        summary = self.curve_tracker.summary()
+        if summary is None:
+            return "현물 10Y−3Y: 추가 RTD 대기", "5·15분 변화: 기준 데이터 대기"
+        positions = []
+        for minutes in (5, 60):
+            point = summary[f"location_{minutes}m"]
+            if point is None:
+                positions.append(f"{minutes}분 위치 준비 중")
+            else:
+                z = "σ=0" if point["zscore"] is None else f"Z {point['zscore']:+.2f}"
+                positions.append(f"{minutes}분 평균 {point['reference_mean_bp']:+.1f}bp 대비 "
+                                 f"{point['distance_bp']:+.1f}bp ({z})")
+        changes = {minutes: summary[f"change_{minutes}m_bp"] for minutes in (5, 15)}
+        trend = " | ".join(f"{minutes}분 변화 " + (f"{value:+.1f}bp" if value is not None else "준비 중")
+                           for minutes, value in changes.items())
+        if all(value is not None for value in changes.values()):
+            five, fifteen = changes[5], changes[15]
+            direction = ("확대 동행" if five > 0 and fifteen > 0 else
+                         "축소 동행" if five < 0 and fifteen < 0 else
+                         "혼조/정체")
+            trend += f" | {direction}"
+        return (f"현재 {summary['spread_bp']:+.1f}bp\n" + "\n".join(positions), trend)
 
     def _render_overview(self, row: dict[str, object] | None, fresh: bool) -> None:
         metrics = market_metrics(row) if row else {}
@@ -311,6 +365,7 @@ class Dashboard(tk.Tk):
                     continue
                 if result.reset_reason:
                     self.flow_analyzer.reset()
+                    self.curve_tracker.reset()
                 self.signal_result = result
                 self.latest_row = row
                 self.fast_result, self.core_result = result.fast, result.core
@@ -319,13 +374,20 @@ class Dashboard(tk.Tk):
                 timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
                 if timestamp.tzinfo is None:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
+                if metric_is_fresh(row, "cash_spread_bp", timestamp, self.extra_settings):
+                    self.curve_tracker.update(row)
+                else:
+                    self.curve_tracker.reset()
                 session = row.get("session_id") or timestamp_kst(timestamp).date()
                 for name, tracker in self.foreign_trackers.items():
-                    source_time = source_timestamp(row.get(f"{name}_foreign_time"), timestamp)
-                    if (source_time is None or
+                    raw_source_time = row.get(f"{name}_foreign_time")
+                    source_time = source_timestamp(raw_source_time, timestamp)
+                    if raw_source_time in (None, "") or (source_time is not None and
                             abs((timestamp.astimezone(timezone.utc) - source_time).total_seconds())
                             <= self.extra_settings.max_source_age_seconds):
                         tracker.update(row, timestamp, session)
+                    else:
+                        tracker.reset()
                 age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
                 if not self.replaying:
                     metrics = market_metrics(row)
@@ -366,6 +428,9 @@ class Dashboard(tk.Tk):
                 self.market_spreads.config(text=self._market_text(row))
                 self.foreign_3y.config(text=self._foreign_text("3y", row))
                 self.foreign_10y.config(text=self._foreign_text("10y", row))
+                curve_position, curve_trend = self._curve_text()
+                self.curve_position.config(text=curve_position)
+                self.curve_trend.config(text=curve_trend)
                 self._render_overview(row, fresh)
             else:
                 self.status.config(text=f"유효 데이터 대기 | 제외 {self.rejected_rows}행")
@@ -390,6 +455,8 @@ class Dashboard(tk.Tk):
             label.config(text="—")
         for label in (self.fast_rv, self.core_rv, self.market_spreads, self.foreign_3y, self.foreign_10y):
             label.config(text="유효 데이터 대기")
+        self.curve_position.config(text="현물 RTD 데이터 대기")
+        self.curve_trend.config(text="5·15분 변화: 기준 데이터 대기")
         self._render_overview(None, False)
 
 
