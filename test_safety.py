@@ -163,16 +163,16 @@ class SafetyTests(unittest.TestCase):
 
     def test_alert_confirmation_hysteresis_and_stale_block(self):
         rule = AlertRule("test", "futures_spread", "above", 3.0,
-                         hysteresis=.1, confirmation_seconds=1, cooldown_seconds=60)
+                         hysteresis=.1, confirmation_seconds=1, cooldown_seconds=0)
         engine = AlertEngine((rule,))
         self.assertEqual(engine.update({"futures_spread": 3.1}, START, True), [])
         events = engine.update({"futures_spread": 3.1}, START + timedelta(seconds=1), True)
         self.assertEqual(len(events), 1)
         self.assertEqual(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=2), True), [])
         engine.update({"futures_spread": 2.89}, START + timedelta(seconds=3), True)
-        engine.update({"futures_spread": 3.2}, START + timedelta(seconds=70), False)
-        self.assertEqual(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=71), True), [])
-        self.assertEqual(len(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=72), True)), 1)
+        engine.update({"futures_spread": 3.2}, START + timedelta(seconds=4), False)
+        self.assertEqual(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=5), True), [])
+        self.assertEqual(len(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=6), True)), 1)
 
     def test_optional_source_times_gate_alert_freshness(self):
         collector = datetime(2026, 10, 15, 1, 0, 10, tzinfo=timezone.utc)

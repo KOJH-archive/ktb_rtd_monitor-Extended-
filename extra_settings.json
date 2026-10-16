@@ -53,7 +53,7 @@
       "upper": null,
       "hysteresis": 0.5,
       "confirmation_seconds": 1,
-      "cooldown_seconds": 60,
+      "cooldown_seconds": 0,
       "enabled": true
     },
     {
@@ -64,7 +64,7 @@
       "upper": null,
       "hysteresis": 0.5,
       "confirmation_seconds": 1,
-      "cooldown_seconds": 60,
+      "cooldown_seconds": 0,
       "enabled": true
     },
     {
@@ -75,7 +75,7 @@
       "upper": null,
       "hysteresis": 0.01,
       "confirmation_seconds": 1,
-      "cooldown_seconds": 60,
+      "cooldown_seconds": 0,
       "enabled": true
     },
     {
@@ -86,7 +86,7 @@
       "upper": null,
       "hysteresis": 0.01,
       "confirmation_seconds": 1,
-      "cooldown_seconds": 60,
+      "cooldown_seconds": 0,
       "enabled": true
     }
   ],

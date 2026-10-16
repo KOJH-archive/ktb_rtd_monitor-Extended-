@@ -445,7 +445,7 @@ class AlertEditor(tk.Toplevel):
             if mode == "between":
                 name += f"~{upper:g}" if upper is not None else ""
             candidate = AlertRule(name=name, metric=metric, mode=mode, lower=lower, upper=upper,
-                                  hysteresis=hysteresis, confirmation_seconds=1, cooldown_seconds=60)
+                                  hysteresis=hysteresis, confirmation_seconds=1, cooldown_seconds=0)
             raw = json.loads(EXTRA_SETTINGS_PATH.read_text(encoding="utf-8"))
             raw["rules"] = [asdict(rule) for rule in (*self.rules, candidate)]
             validated = parse_settings(raw)
