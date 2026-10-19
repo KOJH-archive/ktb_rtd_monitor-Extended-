@@ -79,8 +79,11 @@ def source_timestamp(value: object, collector_timestamp: datetime) -> datetime |
 def metric_is_fresh(row: dict[str, object], metric: str, collector_timestamp: datetime,
                     settings: ExtraSettings) -> bool:
     keys = {"futures_spread": ("3y_trade_time", "10y_trade_time"),
+            "futures_yield_spread_bp": ("3y_trade_time", "10y_trade_time"),
             "cash_spread_bp": ("cash_3y_time", "cash_10y_time"),
-            "3y_trade_price": ("3y_trade_time",), "10y_trade_price": ("10y_trade_time",)}[metric]
+            "3y_trade_price": ("3y_trade_time",), "10y_trade_price": ("10y_trade_time",)}.get(metric)
+    if keys is None:
+        return False
     raw_values = [row.get(key) for key in keys]
     if not any(value not in (None, "") for value in raw_values):
         return True  # Collector freshness only; UI explicitly discloses this limitation.

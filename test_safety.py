@@ -75,6 +75,24 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(view.latest_row["timestamp_utc"], quote(5)["timestamp_utc"])
         self.assertEqual(view.fast_result["samples"], 1)
 
+    def test_fresh_dashboard_accepts_all_derived_metrics(self):
+        row = {**quote(), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+               "3y_trade_price": 103.06, "10y_trade_price": 106.60,
+               "cash_3y_yield_pct": 3.5, "cash_10y_yield_pct": 3.83,
+               "3y_futures_yield_pct": 3.5, "10y_futures_yield_pct": 3.776}
+        view = self._headless_dashboard([row])
+        with patch("dashboard.current_csv", return_value=Path("test.csv")):
+            view.refresh()
+        self.assertIsNotNone(view.latest_row)
+        self.assertEqual(view.rejected_rows, 0)
+        self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "+27.6")
+        stamp = datetime.fromisoformat(row["timestamp_utc"])
+        self.assertTrue(metric_is_fresh(row, "futures_yield_spread_bp", stamp, ExtraSettings()))
+        self.assertFalse(metric_is_fresh({**row, "3y_trade_time": (stamp - timedelta(minutes=1)).isoformat(),
+                                        "10y_trade_time": stamp.isoformat()},
+                                       "futures_yield_spread_bp", stamp, ExtraSettings()))
+        self.assertFalse(metric_is_fresh(row, "unknown_metric", stamp, ExtraSettings()))
+
     def test_stale_foreign_source_discards_rolling_history(self):
         initial = {**quote(), "3y_trade_price": 105.0,
                    "3y_foreign_buy": 100, "3y_foreign_sell": 100}
