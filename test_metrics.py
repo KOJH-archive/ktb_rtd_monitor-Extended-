@@ -143,15 +143,15 @@ class MetricTests(unittest.TestCase):
         self.assertTrue(throttle.should_write(same, now=15.0))
         self.assertTrue(throttle.should_write(changed, now=15.1))
 
-    def test_csv_tail_reads_warmup_then_only_appends(self):
+    def test_csv_tail_skips_history_then_reads_only_appends(self):
         header = "timestamp_utc,3y_mid,10y_mid\n"
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             path = Path(directory) / "snapshots.csv"
             path.write_text(header + "t1,100,101\n" + "t2,100.1,101.2\n", encoding="utf-8")
-            tail = IncrementalCsvTail(warmup_rows=2)
+            tail = IncrementalCsvTail()
             rows, reset = tail.read_new(path)
             self.assertTrue(reset)
-            self.assertEqual([row["timestamp_utc"] for row in rows], ["t1", "t2"])
+            self.assertEqual(rows, [])
             with path.open("a", encoding="utf-8") as handle:
                 handle.write("t3,100.2,101.4\n")
             rows, reset = tail.read_new(path)

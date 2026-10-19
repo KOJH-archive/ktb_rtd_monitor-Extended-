@@ -14,7 +14,7 @@ from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer
 from cash_risk import CashDay, _changes, load_cash_days, oos_check, target_packages
 from curve_context import CashCurveTracker
 from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, load_settings
-from dashboard import Dashboard, IncrementalCsvTail
+from dashboard import Dashboard, IncrementalCsvTail, current_csv
 from decision_support import OrderFlowAnalyzer, risk_metrics
 from extra_settings import AlertRule, ExtraSettings, parse_settings
 from ktb_rtd_monitor import ExcelRtdReader, FeedUnavailable, SnapshotLogger, _numbers
@@ -65,6 +65,7 @@ class SafetyTests(unittest.TestCase):
             with patch("dashboard.current_csv", return_value=Path("test.csv")):
                 view.refresh()
             self.assertIn("사용 금지", view.decision.config.call_args.kwargs["text"])
+            self.assertEqual(view.kpis["3y_trade_price"].config.call_args.kwargs["text"], "—")
 
     def test_dashboard_bad_row_does_not_discard_rest_of_batch(self):
         view = self._headless_dashboard([{**quote(), "3y_spread": 0}, quote(5)])
@@ -409,8 +410,8 @@ class SafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
             path = Path(folder) / "data.csv"
             path.write_bytes(b"a,b\r\n1,2\r\n3,")
-            tail = IncrementalCsvTail(2)
-            self.assertEqual(tail.read_new(path)[0], [{"a": "1", "b": "2"}])
+            tail = IncrementalCsvTail()
+            self.assertEqual(tail.read_new(path)[0], [])
             with path.open("ab") as handle:
                 handle.write(b"4\r")
             self.assertEqual(tail.read_new(path)[0], [])
@@ -420,7 +421,19 @@ class SafetyTests(unittest.TestCase):
             path.write_bytes(b"a,b\n5,6\n")
             rows, reset = tail.read_new(path)
             self.assertTrue(reset)
-            self.assertEqual(rows, [{"a": "5", "b": "6"}])
+            self.assertEqual(rows, [])
+
+    def test_dashboard_ignores_undated_old_log(self):
+        from analyze_snapshots import timestamp_kst
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            data_dir = Path(folder)
+            (data_dir / "snapshots_enhanced.csv").write_text("old\n", encoding="utf-8")
+            day = timestamp_kst(datetime.now(timezone.utc)).strftime("%Y%m%d")
+            today = data_dir / f"snapshots_enhanced_{day}.csv"
+            with patch("dashboard.DATA_DIR", data_dir):
+                self.assertEqual(current_csv(), today)
+                today.write_text("new\n", encoding="utf-8")
+                self.assertEqual(current_csv(), today)
 
     def test_logger_rejects_schema_without_appending(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as folder:
@@ -450,10 +463,19 @@ class SafetyTests(unittest.TestCase):
         sheet.range.return_value.options.return_value.value = block
         reader = ExcelRtdReader("unused", "Sheet1")
         reader._sheet = sheet
+        reader._extra_snapshot = MagicMock(return_value={"3y_futures_yield_pct": "",
+                                                         "10y_futures_yield_pct": ""})
         row = reader.snapshot()
         sheet.range.assert_called_once_with("C2:O11")
         self.assertAlmostEqual(row["3y_best_ask"], 100.01)
         self.assertAlmostEqual(row["10y_best_bid"], 100)
+        self.assertIn("futures_yield_spread_bp", row)
+        self.assertEqual(row["futures_yield_spread_bp"], "")
+        reader._extra_snapshot = MagicMock(return_value={"3y_futures_yield_pct": 3.5,
+                                                         "10y_futures_yield_pct": 3.8})
+        with_yields = reader.snapshot()
+        self.assertEqual(list(row), list(with_yields))
+        self.assertAlmostEqual(with_yields["futures_yield_spread_bp"], 30.0)
 
     def test_collector_reads_configured_extra_rtd_block(self):
         block = [[None] * 13 for _ in range(10)]

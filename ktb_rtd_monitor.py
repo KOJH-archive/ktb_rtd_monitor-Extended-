@@ -141,6 +141,10 @@ class ExcelRtdReader:
                                     [values[offset + 1] for values in block[:5]],
                                     [values[offset] for values in block[:5]]))
             row.update(self._extra_snapshot())
+            # Keep the persisted schema stable even when optional RTD values
+            # are temporarily blank. A later valid value must not stop logging.
+            row.update({"futures_spread": "", "cash_spread_bp": "",
+                        "futures_yield_spread_bp": ""})
             row.update(market_metrics(row))
             return row
         except Exception as exc:
@@ -359,12 +363,11 @@ def main() -> int:
     extra_settings = load_extra_settings(args.extra_settings)
     reader = ExcelRtdReader(args.workbook, args.sheet, extra_settings)
     enhanced = any(binding is not None for binding in extra_settings.bindings.values())
-    logger = SnapshotLogger(args.output_dir, args.log in ("csv", "both"), args.log in ("sqlite", "both"),
-                            flush_interval=args.flush_ms / 1000,
-                            file_stem="snapshots_enhanced" if enhanced else "snapshots_with_trades")
+    logger: SnapshotLogger | None = None
+    log_day: str | None = None
     throttle = SnapshotThrottle(args.heartbeat_seconds)
     rv_state = RollingRV()
-    last_error: str | None = None
+    last_error_times: dict[str, float] = {}
     try:
         while True:
             started = time.perf_counter()
@@ -372,21 +375,37 @@ def main() -> int:
                 row = reader.snapshot()
                 rv = None if args.quiet else rv_state.update(row)
                 if args.log_all or throttle.should_write(row):
+                    day = timestamp_kst(row["timestamp_utc"]).strftime("%Y%m%d")
+                    if day != log_day:
+                        if logger is not None:
+                            logger.close()
+                        stem = "snapshots_enhanced" if enhanced else "snapshots_with_trades"
+                        logger = SnapshotLogger(args.output_dir, args.log in ("csv", "both"),
+                                                args.log in ("sqlite", "both"),
+                                                flush_interval=args.flush_ms / 1000,
+                                                file_stem=f"{stem}_{day}")
+                        log_day = day
                     logger.write(row)
-                logger.flush()
+                if logger is not None:
+                    logger.flush()
                 if not args.quiet:
                     display(row, args.interval_ms, rv, not args.no_clear)
-                last_error = None
+                last_error_times.clear()
             except FeedUnavailable as exc:
-                if str(exc) != last_error:
-                    print(f"[waiting for Excel] {exc}", file=sys.stderr); last_error = str(exc)
+                message = str(exc)
+                now = time.monotonic()
+                if now - last_error_times.get(message, -float("inf")) >= 60:
+                    print(f"[waiting for Excel] {exc}", file=sys.stderr)
+                    last_error_times[message] = now
             finally:
-                logger.flush()
+                if logger is not None:
+                    logger.flush()
             time.sleep(max(0.0, args.interval_ms / 1000 - (time.perf_counter() - started)))
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        logger.close()
+        if logger is not None:
+            logger.close()
     return 0
 
 

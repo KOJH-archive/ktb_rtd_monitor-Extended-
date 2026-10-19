@@ -21,22 +21,21 @@ SETTINGS_PATH = Path(__file__).parent / "settings.json"
 EXTRA_SETTINGS_PATH = Path(__file__).parent / "extra_settings.json"
 
 def current_csv() -> Path:
-    """Use the live trade-price log when it exists, otherwise the legacy log."""
-    enhanced_csv = DATA_DIR / "snapshots_enhanced.csv"
-    trade_csv = DATA_DIR / "snapshots_with_trades.csv"
-    legacy_csv = DATA_DIR / "snapshots.csv"
-    if enhanced_csv.exists() and enhanced_csv.stat().st_size > 0:
+    """Select only today's KST log; never fall back to a prior session."""
+    day = timestamp_kst(datetime.now(timezone.utc)).strftime("%Y%m%d")
+    enhanced_csv = DATA_DIR / f"snapshots_enhanced_{day}.csv"
+    trade_csv = DATA_DIR / f"snapshots_with_trades_{day}.csv"
+    if enhanced_csv.exists():
         return enhanced_csv
-    if trade_csv.exists() and trade_csv.stat().st_size > 0:
+    if trade_csv.exists():
         return trade_csv
-    return legacy_csv
+    return enhanced_csv
 
 
 class IncrementalCsvTail:
-    """Read only appended CSV rows after a bounded one-time warm-up."""
+    """Read only rows appended after attachment, without historical replay."""
 
-    def __init__(self, warmup_rows: int = 20_000) -> None:
-        self.warmup_rows = warmup_rows
+    def __init__(self) -> None:
         self.path: Path | None = None
         self.offset = 0
         self.header: list[str] = []
@@ -65,17 +64,13 @@ class IncrementalCsvTail:
             handle.seek(0, 2)
             self.offset = handle.tell()
             self.identity = os.fstat(handle.fileno()).st_ino
-            # Same handle and fixed end offset: appends cannot race the warm-up.
-            start = max(header_end, self.offset - 16 * 1024 * 1024)
-            handle.seek(start)
-            data = handle.read(self.offset - start)
-            if start > header_end:
-                data = data.partition(b"\n")[2]
+            handle.seek(max(header_end, self.offset - 65536))
+            tail_end = handle.read(self.offset - handle.tell())
         self.path = path
         self.header = next(csv.reader([header_line.decode("utf-8-sig").strip()]))
-        lines = data.split(b"\n")
-        self.pending = lines.pop()
-        return self._parse([line.rstrip(b"\r") for line in lines[-self.warmup_rows:]])
+        # Preserve only an in-flight partial line, not completed old records.
+        self.pending = tail_end.rpartition(b"\n")[2] if b"\n" in tail_end else b""
+        return []
 
     def read_new(self, path: Path) -> tuple[list[dict[str, str]], bool]:
         stat = path.stat()
@@ -466,6 +461,11 @@ class Dashboard(tk.Tk):
                 self.curve_position.config(text=curve_position)
                 self.curve_trend.config(text=curve_trend)
                 self._render_overview(row, fresh)
+                if not fresh and not self.pending_rows:
+                    self.flow.config(text="호가잔량 압력: 최신 데이터 대기")
+                    self.basis.config(text="수동 적정가 비교: 최신 데이터 대기")
+                    self.cost.config(text="비용필터: 최신 데이터 대기")
+                    self._clear_market_display()
             else:
                 self.status.config(text=f"유효 데이터 대기 | 제외 {self.rejected_rows}행")
                 self.decision.config(text="유효 데이터 없음 — 신호 차단")
@@ -473,6 +473,18 @@ class Dashboard(tk.Tk):
                 self.basis.config(text="수동 적정가 비교: 데이터 대기")
                 self.cost.config(text="비용필터: 데이터 대기")
                 self._clear_market_display()
+        except FileNotFoundError:
+            if self.tail.path is not None or self.latest_row is not None:
+                self._reset_analyzers()
+                self.pending_rows.clear()
+                self.tail = IncrementalCsvTail()
+            self.status.config(text="오늘 실시간 데이터 대기 · Excel RTD와 수집기 연결 확인", fg=WARN)
+            self.decision.config(text="오늘 데이터 없음 — 신호 차단", fg=WARN)
+            self.flow.config(text="호가잔량 압력: 오늘 데이터 대기")
+            self.basis.config(text="수동 적정가 비교: 오늘 데이터 대기")
+            self.cost.config(text="비용필터: 오늘 데이터 대기")
+            self.alert_status.config(text="오늘 데이터 대기 · 알림 중지", fg=MUTED)
+            self._clear_market_display()
         except (OSError, KeyError, ValueError, TypeError, csv.Error) as exc:
             self._reset_analyzers()
             self.pending_rows.clear()
