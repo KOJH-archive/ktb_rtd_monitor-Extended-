@@ -248,6 +248,21 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=5), True), [])
         self.assertEqual(len(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=6), True)), 1)
 
+    def test_futures_yield_alert_configuration_and_bp_trigger(self):
+        settings = parse_settings({"rules": [{"name": "yield curve", "metric": "futures_yield_spread_bp",
+                                               "mode": "above", "lower": 28,
+                                               "confirmation_seconds": 1, "cooldown_seconds": 0,
+                                               "hysteresis": .5}]})
+        engine = AlertEngine(settings.rules)
+        metrics = market_metrics({"3y_futures_yield_pct": 3.934, "10y_futures_yield_pct": 4.221})
+        self.assertEqual(engine.update(metrics, START, True), [])
+        events = engine.update(metrics, START + timedelta(seconds=1), True)
+        self.assertEqual(len(events), 1)
+        self.assertAlmostEqual(events[0].value, 28.7)
+        engine.update({"futures_yield_spread_bp": 27.4}, START + timedelta(seconds=2), True)
+        self.assertEqual(engine.update(metrics, START + timedelta(seconds=3), True), [])
+        self.assertEqual(len(engine.update(metrics, START + timedelta(seconds=4), True)), 1)
+
     def test_optional_source_times_gate_alert_freshness(self):
         collector = datetime(2026, 10, 15, 1, 0, 10, tzinfo=timezone.utc)
         self.assertEqual(source_timestamp("10:00:05", collector),

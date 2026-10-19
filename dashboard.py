@@ -597,7 +597,7 @@ class AlertEditor(tk.Toplevel):
             mode = self.MODE_NAMES[self.mode_name.get()]
             lower = float(self.lower.get())
             upper = float(self.upper.get()) if self.upper.get().strip() else None
-            hysteresis = .5 if metric == "cash_spread_bp" else .01
+            hysteresis = .5 if metric in ("cash_spread_bp", "futures_yield_spread_bp") else .01
             name = f"{self.metric_name.get()} {self.mode_name.get()} {lower:g}"
             if mode == "between":
                 name += f"~{upper:g}" if upper is not None else ""

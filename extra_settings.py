@@ -15,6 +15,7 @@ FEED_FIELDS = (
     "cash_3y_bond", "cash_10y_bond",
 )
 METRICS = {"futures_spread": "10년−3년 선물 체결가차 (pt)",
+           "futures_yield_spread_bp": "10년−3년 선물 수익률 차 (bp)",
            "cash_spread_bp": "현물 10년−3년 체결수익률차 (bp)",
            "3y_trade_price": "3년 선물 체결가", "10y_trade_price": "10년 선물 체결가"}
 
