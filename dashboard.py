@@ -159,23 +159,51 @@ class Dashboard(tk.Tk):
         popup.resizable(False, False)
         popup.attributes("-topmost", True)
         popup.protocol("WM_DELETE_WINDOW", popup.destroy)
-        frame = tk.Frame(popup, bg="#fff7df", padx=18, pady=13)
+        frame = tk.Frame(popup, bg="#fff7df", padx=18, pady=13,
+                         highlightthickness=3, highlightbackground="#d69a20")
         frame.pack(fill="both", expand=True)
-        tk.Label(frame, text="KTB 가격 알림", bg="#fff7df", fg="#7a4300",
-                 font=("맑은 고딕", 12, "bold"), anchor="w").pack(fill="x")
+        heading = tk.Label(frame, text="KTB 가격 알림 · 확인할 때까지 표시", bg="#fff7df", fg="#7a4300",
+                           font=("맑은 고딕", 12, "bold"), anchor="w")
+        heading.pack(fill="x")
         tk.Label(frame, text=event.name, bg="#fff7df", fg="#241b10",
                  font=("맑은 고딕", 11), anchor="w", justify="left", wraplength=330).pack(fill="x", pady=(5, 0))
-        tk.Label(frame, text=f"현재값  {event.value:+.3f}", bg="#fff7df", fg="#241b10",
+        tk.Label(frame, text=f"알림 발생값  {event.value:+.3f}", bg="#fff7df", fg="#241b10",
                  font=("Consolas", 15, "bold"), anchor="w").pack(fill="x", pady=(4, 8))
-        tk.Button(frame, text="닫기", command=popup.destroy, relief="flat",
+        tk.Button(frame, text="확인 · 닫기", command=popup.destroy, relief="flat",
                   bg="#e6c76a", activebackground="#d7b453", fg="#241b10",
                   font=("맑은 고딕", 9), padx=10).pack(anchor="e")
         popup.update_idletasks()
         width, height = popup.winfo_width(), popup.winfo_height()
-        x = popup.winfo_screenwidth() - width - 28
+        x = 28
         y = popup.winfo_screenheight() - height - 70
         popup.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
-        popup.after(8000, lambda: popup.destroy() if popup.winfo_exists() else None)
+        blink_job = None
+        bright = False
+
+        def blink():
+            nonlocal blink_job, bright
+            if not popup.winfo_exists():
+                return
+            bright = not bright
+            frame.configure(highlightbackground="#d69a20" if bright else "#fff7df")
+            heading.configure(bg="#ffe5a0" if bright else "#fff7df")
+            blink_job = popup.after(700, blink)
+
+        def cleanup(event):
+            nonlocal blink_job
+            if event.widget is not popup:
+                return
+            if blink_job is not None:
+                try:
+                    popup.after_cancel(blink_job)
+                except tk.TclError:
+                    pass
+                blink_job = None
+            if self.alert_popup is popup:
+                self.alert_popup = None
+
+        popup.bind("<Destroy>", cleanup, add="+")
+        blink()
 
     def _risk_text(self) -> str:
         metrics = risk_metrics(self.settings.risk)

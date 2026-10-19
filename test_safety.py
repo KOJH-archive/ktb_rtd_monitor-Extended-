@@ -135,16 +135,30 @@ class SafetyTests(unittest.TestCase):
 
     def test_alert_popup_is_non_modal_and_replaces_previous_popup(self):
         view = self._headless_dashboard([])
-        view.alert_popup = None
-        view.show_alert_popup = MethodType(Dashboard.show_alert_popup, view)
+        previous = MagicMock()
+        view.alert_popup = previous
         popup = MagicMock()
         popup.winfo_exists.return_value = True
-        popup.destroy = MagicMock()
-        view.alert_popup = popup
-        # No Tk root is created in the headless suite; the live UI path is
-        # smoke-tested by preview_dashboard.py. This verifies replacement policy.
-        view.alert_popup.destroy()
-        popup.destroy.assert_called_once()
+        popup.winfo_width.return_value = 380
+        popup.winfo_height.return_value = 180
+        popup.winfo_screenheight.return_value = 1080
+        popup.after.return_value = "blink-job"
+        with patch("dashboard.tk.Toplevel", return_value=popup), patch("dashboard.tk.Frame"), \
+                patch("dashboard.tk.Label"), patch("dashboard.tk.Button"):
+            Dashboard.show_alert_popup(view, SimpleNamespace(name="test", value=33.0))
+        previous.destroy.assert_called_once()
+        popup.geometry.assert_called_once_with("380x180+28+830")
+        popup.grab_set.assert_not_called()
+        popup.focus_force.assert_not_called()
+        delay, callback = popup.after.call_args.args
+        self.assertEqual(delay, 700)
+        callback()
+        self.assertEqual(popup.after.call_count, 2)
+        popup.destroy.assert_not_called()
+        cleanup = popup.bind.call_args.args[1]
+        cleanup(SimpleNamespace(widget=popup))
+        popup.after_cancel.assert_called_once_with("blink-job")
+        self.assertIsNone(view.alert_popup)
 
     def test_dashboard_batches_history_without_dropping_rows_or_replaying_alerts(self):
         view = self._headless_dashboard([quote(i / 4, 100 + i / 10000) for i in range(620)])
