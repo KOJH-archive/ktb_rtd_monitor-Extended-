@@ -515,13 +515,21 @@ class AlertEditor(tk.Toplevel):
         super().__init__(dashboard)
         self.dashboard = dashboard
         self.title("가격 알림 설정")
-        self.geometry("760x430")
+        self.geometry("800x480")
+        self.minsize(760, 400)
         self.transient(dashboard)
         self.metric_name = tk.StringVar(value=next(iter(METRICS.values())))
         self.mode_name = tk.StringVar(value="이상")
         self.lower = tk.StringVar()
         self.upper = tk.StringVar()
         self.rules = list(dashboard.extra_settings.rules)
+        # Reserve the footer before the expanding list, including at high DPI.
+        footer = tk.Frame(self)
+        footer.pack(side="bottom", fill="x", padx=12, pady=10)
+        tk.Button(footer, text="저장·적용", command=self.save).pack(side="right", padx=4)
+        tk.Button(footer, text="취소", command=self.destroy).pack(side="right", padx=4)
+        tk.Label(footer, text="추가·삭제한 조건은 ‘저장·적용’을 눌러야 반영됩니다.",
+                 fg="#555555").pack(side="left")
         form = tk.Frame(self); form.pack(fill="x", padx=12, pady=10)
         for column, (label, widget) in enumerate((
             ("대상", tk.OptionMenu(form, self.metric_name, *METRICS.values())),
@@ -532,13 +540,17 @@ class AlertEditor(tk.Toplevel):
             tk.Label(form, text=label).grid(row=0, column=column, padx=5)
             widget.grid(row=1, column=column, padx=5)
         tk.Button(form, text="추가", command=self.add_rule).grid(row=1, column=4, padx=8)
-        self.listbox = tk.Listbox(self, height=12, font=("Consolas", 10)); self.listbox.pack(fill="both", expand=True, padx=12)
-        buttons = tk.Frame(self); buttons.pack(pady=10)
-        tk.Button(buttons, text="선택 삭제", command=self.delete_rule).pack(side="left", padx=4)
-        tk.Button(buttons, text="저장", command=self.save).pack(side="left", padx=4)
-        tk.Button(buttons, text="닫기", command=self.destroy).pack(side="left", padx=4)
-        tk.Label(self, text="조건 진입 1초 후 1회 알림. 기준에서 1틱 이상 이탈해야 다시 무장됩니다.",
-                 fg="#555555").pack(pady=(0, 8))
+        toolbar = tk.Frame(self)
+        toolbar.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(toolbar, text="등록된 알림 조건 · Ctrl/Shift로 여러 개 선택").pack(side="left")
+        self.delete_button = tk.Button(toolbar, text="선택한 조건 삭제", command=self.delete_rule,
+                                       state="disabled")
+        self.delete_button.pack(side="right")
+        self.listbox = tk.Listbox(self, height=8, font=("맑은 고딕", 10),
+                                 selectmode=tk.EXTENDED, exportselection=False)
+        self.listbox.pack(fill="both", expand=True, padx=12)
+        self.listbox.bind("<<ListboxSelect>>", self.selection_changed)
+        self.listbox.bind("<Delete>", self.delete_rule)
         self.refresh_list()
 
     def refresh_list(self) -> None:
@@ -546,6 +558,10 @@ class AlertEditor(tk.Toplevel):
         for rule in self.rules:
             upper = f" ~ {rule.upper:g}" if rule.mode == "between" else ""
             self.listbox.insert(tk.END, f"{rule.name}: {METRICS[rule.metric]} {rule.mode} {rule.lower:g}{upper}")
+        self.selection_changed()
+
+    def selection_changed(self, event=None) -> None:
+        self.delete_button.config(state="normal" if self.listbox.curselection() else "disabled")
 
     def add_rule(self) -> None:
         try:
@@ -567,10 +583,13 @@ class AlertEditor(tk.Toplevel):
         except (ValueError, StopIteration, TypeError) as exc:
             self.title(f"가격 알림 설정 — 입력 오류: {exc}")
 
-    def delete_rule(self) -> None:
+    def delete_rule(self, event=None) -> str:
         selection = self.listbox.curselection()
         if selection:
-            self.rules.pop(selection[0]); self.refresh_list()
+            for index in sorted(selection, reverse=True):
+                self.rules.pop(index)
+            self.refresh_list()
+        return "break"
 
     def save(self) -> None:
         raw = json.loads(EXTRA_SETTINGS_PATH.read_text(encoding="utf-8"))

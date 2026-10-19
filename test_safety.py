@@ -14,7 +14,7 @@ from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer
 from cash_risk import CashDay, _changes, load_cash_days, oos_check, target_packages
 from curve_context import CashCurveTracker
 from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, load_settings
-from dashboard import Dashboard, IncrementalCsvTail, current_csv
+from dashboard import AlertEditor, Dashboard, IncrementalCsvTail, current_csv
 from decision_support import OrderFlowAnalyzer, risk_metrics
 from extra_settings import AlertRule, ExtraSettings, parse_settings
 from ktb_rtd_monitor import ExcelRtdReader, FeedUnavailable, SnapshotLogger, _numbers
@@ -38,6 +38,25 @@ def quote(seconds=0, mid10=100.0):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_alert_editor_deletes_selected_rules_and_saves_remaining_settings(self):
+        for selected, expected in (((0, 2), ["b"]), ((0, 1, 2), [])):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory(dir=ROOT) as folder:
+                path = Path(folder) / "extra_settings.json"
+                raw = {"sound_enabled": False, "rules": [
+                    {"name": name, "metric": "cash_spread_bp", "mode": "above", "lower": 30}
+                    for name in ("a", "b", "c")]}
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                editor = SimpleNamespace(rules=list(parse_settings(raw).rules), listbox=MagicMock(),
+                                         refresh_list=MagicMock(), dashboard=MagicMock(), destroy=MagicMock())
+                editor.listbox.curselection.return_value = selected
+                AlertEditor.delete_rule(editor)
+                with patch("dashboard.EXTRA_SETTINGS_PATH", path):
+                    AlertEditor.save(editor)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual([rule.name for rule in parse_settings(saved).rules], expected)
+                self.assertFalse(saved["sound_enabled"])
+                editor.dashboard.reload_alerts.assert_called_once()
+
     def _headless_dashboard(self, rows):
         view = SimpleNamespace(settings=AppSettings(), extra_settings=ExtraSettings(), rejected_rows=0,
                                tail=MagicMock(), after=MagicMock(), winfo_id=MagicMock(return_value=1),
