@@ -14,7 +14,7 @@ from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer
 from cash_risk import CashDay, _changes, load_cash_days, oos_check, target_packages
 from curve_context import CashCurveTracker
 from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, load_settings
-from dashboard import AlertEditor, Dashboard, IncrementalCsvTail, current_csv
+from dashboard import AlertEditor, Dashboard, ForeignHistoryReplay, IncrementalCsvTail, current_csv
 from decision_support import OrderFlowAnalyzer, risk_metrics
 from extra_settings import AlertRule, ExtraSettings, parse_settings
 from ktb_rtd_monitor import ExcelRtdReader, FeedUnavailable, SnapshotLogger, _numbers
@@ -63,7 +63,8 @@ class SafetyTests(unittest.TestCase):
                                pending_rows=deque(), replaying=False, kpis={
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
                                                                "futures_yield_spread_bp", "cash_spread_bp")})
-        for method in ("_reset_analyzers", "_decision_text", "_flow_text", "_basis_text", "_cost_text",
+        for method in ("_reset_analyzers", "_ingest_foreign_row", "_restore_foreign_history",
+                       "_decision_text", "_flow_text", "_basis_text", "_cost_text",
                        "_market_text", "_foreign_text", "_curve_text", "_sizing_text", "_render_overview",
                        "_clear_market_display", "refresh"):
             setattr(view, method, MethodType(getattr(Dashboard, method), view))
@@ -228,10 +229,17 @@ class SafetyTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["cash_spread_bp"], 32.7)
         self.assertAlmostEqual(metrics["futures_yield_spread_bp"], 28.7)
         self.assertNotIn("futures_yield_spread_bp", market_metrics({"3y_futures_yield_pct": 3.934}))
+        self.assertNotIn("cash_spread_bp", market_metrics({"cash_3y_yield_pct": 0,
+                                                           "cash_10y_yield_pct": 4.188}))
+        self.assertNotIn("futures_yield_spread_bp", market_metrics({"3y_futures_yield_pct": 0,
+                                                                    "10y_futures_yield_pct": 4.221}))
         view = self._headless_dashboard([])
         view._render_overview({"3y_futures_yield_pct": 3.934,
                                "10y_futures_yield_pct": 4.221}, True)
         self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "+28.7")
+        view._render_overview({"cash_3y_yield_pct": 0, "cash_10y_yield_pct": 4.188}, True)
+        self.assertEqual(view.kpis["cash_spread_bp"].config.call_args.kwargs["text"], "N/A")
+        self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "N/A")
         with self.assertRaises(ValueError):
             parse_settings({"bindings": {"cash_3y_yield_pct": {"sheet": "x", "cell": "B0"}}})
 
@@ -247,6 +255,15 @@ class SafetyTests(unittest.TestCase):
         engine.update({"futures_spread": 3.2}, START + timedelta(seconds=4), False)
         self.assertEqual(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=5), True), [])
         self.assertEqual(len(engine.update({"futures_spread": 3.2}, START + timedelta(seconds=6), True)), 1)
+
+    def test_missing_yield_resets_alert_confirmation(self):
+        rule = AlertRule("cash", "cash_spread_bp", "above", 30,
+                         confirmation_seconds=1, cooldown_seconds=0)
+        engine = AlertEngine((rule,))
+        self.assertEqual(engine.update({"cash_spread_bp": 32}, START, True), [])
+        self.assertEqual(engine.update({}, START + timedelta(seconds=1), True), [])
+        self.assertEqual(engine.update({"cash_spread_bp": 32}, START + timedelta(seconds=2), True), [])
+        self.assertEqual(len(engine.update({"cash_spread_bp": 32}, START + timedelta(seconds=3), True)), 1)
 
     def test_futures_yield_alert_configuration_and_bp_trigger(self):
         settings = parse_settings({"rules": [{"name": "yield curve", "metric": "futures_yield_spread_bp",
@@ -288,6 +305,69 @@ class SafetyTests(unittest.TestCase):
         reset = {**second, "3y_foreign_buy": 5, "3y_foreign_sell": 4}
         tracker.update(reset, START + timedelta(seconds=6), START.date())
         self.assertIsNone(tracker.summary()["buy"])
+
+    def test_foreign_gap_preserves_old_zones_but_skips_unpriced_volume(self):
+        tracker = ForeignFlowTracker("3y", ExtraSettings(flow_max_gap_seconds=10))
+        base = {"3y_foreign_buy": 100, "3y_foreign_sell": 100, "3y_trade_price": 105}
+        tracker.update(base, START, START.date())
+        tracker.update({**base, "3y_foreign_buy": 110}, START + timedelta(seconds=5), START.date())
+        tracker.update({**base, "3y_foreign_buy": 160, "3y_trade_price": 106},
+                       START + timedelta(seconds=35), START.date())
+        self.assertEqual(tracker.summary()["buy"]["observed_volume"], 10)
+        self.assertFalse(tracker.summary()["windows"][5]["complete"])
+        tracker.update({**base, "3y_foreign_buy": 180, "3y_trade_price": 106},
+                       START + timedelta(seconds=40), START.date())
+        self.assertEqual(tracker.summary()["buy"]["observed_volume"], 30)
+        self.assertIsNone(tracker.summary()["sell"])
+        tracker.pause()
+        tracker.update({**base, "3y_foreign_buy": 5}, START + timedelta(seconds=45), START.date())
+        self.assertIsNone(tracker.summary()["buy"])
+
+    def test_dashboard_restores_only_today_foreign_flow_without_alert_replay(self):
+        start = datetime.now(timezone.utc) - timedelta(seconds=90)
+        if (start + timedelta(seconds=50)).astimezone(timezone(timedelta(hours=9))).date() != \
+                start.astimezone(timezone(timedelta(hours=9))).date():
+            self.skipTest("KST day boundary")
+        base = {**quote(), "timestamp_utc": start.isoformat(),
+                "3y_trade_price": 105, "10y_trade_price": 106,
+                "3y_foreign_buy": 100, "3y_foreign_sell": 100,
+                "10y_foreign_buy": 200, "10y_foreign_sell": 200}
+        rows = [base,
+                {**base, "timestamp_utc": (start + timedelta(seconds=5)).isoformat(),
+                 "3y_foreign_buy": 110},
+                {**base, "timestamp_utc": (start + timedelta(seconds=40)).isoformat(),
+                 "3y_foreign_buy": 160, "3y_trade_price": 106},
+                {**base, "timestamp_utc": (start + timedelta(seconds=45)).isoformat(),
+                 "3y_foreign_buy": 180, "3y_trade_price": 106}]
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            path = Path(folder) / "today.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(base))
+                writer.writeheader()
+                writer.writerows(rows)
+            view = self._headless_dashboard([])
+            view.tail = IncrementalCsvTail()
+            with patch("dashboard.current_csv", return_value=path):
+                view.refresh()
+                self.assertIsInstance(view.flow_history, ForeignHistoryReplay)
+                view.alert_engine.update = MagicMock(return_value=[])
+                with path.open("a", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(base))
+                    writer.writerow({**base, "timestamp_utc": (start + timedelta(seconds=50)).isoformat(),
+                                     "3y_foreign_buy": 190, "3y_trade_price": 106})
+                while view.flow_history is not None:
+                    view.refresh()
+                self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 40)
+                view.alert_engine.update.assert_not_called()
+                self.assertIsNotNone(view.latest_row)
+                with path.open("a", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(base))
+                    writer.writerow({**base, "timestamp_utc": (start + timedelta(seconds=55)).isoformat(),
+                                     "3y_foreign_buy": 200, "3y_trade_price": 106})
+                view.refresh()
+                self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 50)
+                self.assertIsNotNone(view.latest_row)
+                view.alert_engine.update.assert_called_once()
 
     def test_foreign_rolling_windows_exclude_old_flow_and_flag_partial_history(self):
         tracker = ForeignFlowTracker("3y", ExtraSettings())
@@ -573,6 +653,39 @@ class SafetyTests(unittest.TestCase):
         extra.range.assert_called_once_with("B1:B10")
         self.assertAlmostEqual(row["cash_spread_bp"], 32.7)
         self.assertEqual(row["3y_foreign_buy"], 119111)
+        extra.range.return_value.options.return_value.value = [[0], [4.188], [0], [118204],
+                                                                [102.95], [0], [78687], [78086],
+                                                                [106.30], [4.221]]
+        missing = reader.snapshot()
+        self.assertEqual(list(row), list(missing))
+        self.assertEqual(missing["cash_3y_yield_pct"], "")
+        self.assertEqual(missing["3y_futures_yield_pct"], "")
+        self.assertEqual(missing["3y_foreign_buy"], 0)
+        self.assertEqual(missing["cash_spread_bp"], "")
+        self.assertEqual(missing["futures_yield_spread_bp"], "")
+        self.assertAlmostEqual(missing["3y_trade_price"], 100)
+        extra.range.return_value.options.return_value.value = [[3.861], [4.188], [119111], [118204],
+                                                                [102.95], [3.948], [78687], [78086],
+                                                                [106.30], [4.221]]
+        recovered = reader.snapshot()
+        self.assertAlmostEqual(recovered["cash_spread_bp"], 32.7)
+        self.assertAlmostEqual(recovered["futures_yield_spread_bp"], 27.3)
+        block[0][4] = 0
+        no_trade = reader.snapshot()
+        self.assertEqual(no_trade["3y_trade_price"], "")
+        self.assertEqual(no_trade["futures_spread"], "")
+        self.assertGreater(no_trade["3y_mid"], 0)
+        self.assertNotIn("3y_trade_price", market_metrics({"3y_trade_price": 0}))
+        view = self._headless_dashboard([])
+        view._render_overview(no_trade, True)
+        self.assertEqual(view.kpis["3y_trade_price"].config.call_args.kwargs["text"], "N/A")
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            logger = SnapshotLogger(Path(folder), csv_enabled=True, sqlite_enabled=False)
+            for sample in (missing, recovered, no_trade):
+                logger.write(sample)
+            logger.close()
+            with logger.csv_path.open(newline="", encoding="utf-8-sig") as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 3)
 
     def _replay_fixture(self, folder, rows, signals):
         path, settings = Path(folder) / "input.csv", Path(folder) / "settings.json"

@@ -11,7 +11,7 @@ from decision_support import OrderFlowAnalyzer, basis_metrics, execution_gate, r
 from extra_settings import METRICS, AlertRule, load_extra_settings, parse_settings
 from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
                                market_metrics, metric_is_fresh, source_timestamp)
-from signal_engine import SignalEngine
+from signal_engine import SignalEngine, validated_row
 from curve_context import CashCurveTracker
 from cash_risk import load_cash_days, target_packages
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
@@ -90,6 +90,44 @@ class IncrementalCsvTail:
         return self._parse([line.rstrip(b"\r\n") for line in lines]), False
 
 
+class ForeignHistoryReplay:
+    """Read a fixed startup slice of today's CSV without replaying signals."""
+
+    def __init__(self, path: Path, limit: int) -> None:
+        self.path, self.limit = path, limit
+        with path.open("rb") as handle:
+            header = handle.readline()
+            if not header.endswith(b"\n"):
+                raise ValueError("Incomplete CSV header")
+            self.offset = handle.tell()
+            self.identity = os.fstat(handle.fileno()).st_ino
+        self.header = next(csv.reader([header.decode("utf-8-sig").strip()]))
+        self.rows_read = 0
+
+    def read_batch(self, maximum: int = 500) -> list[dict[str, str]]:
+        rows = []
+        with self.path.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_ino != self.identity or os.fstat(handle.fileno()).st_size < self.limit:
+                raise OSError("Today's CSV changed during foreign-flow restoration")
+            handle.seek(self.offset)
+            while len(rows) < maximum and handle.tell() < self.limit:
+                raw = handle.readline(self.limit - handle.tell())
+                if not raw.endswith(b"\n"):
+                    self.offset = self.limit
+                    break
+                self.offset = handle.tell()
+                values = next(csv.reader([raw.decode("utf-8")]))
+                if values == self.header:
+                    continue
+                rows.append(dict(zip(self.header, values)) if len(values) == len(self.header) else {})
+        self.rows_read += len(rows)
+        return rows
+
+    @property
+    def done(self) -> bool:
+        return self.offset >= self.limit
+
+
 def numeric_row(row: dict[str, str]) -> dict[str, object]:
     parsed: dict[str, object] = {}
     for key, value in row.items():
@@ -134,6 +172,39 @@ class Dashboard(tk.Tk):
         self.notifier = WindowsNotifier(self.extra_settings)
         self.foreign_trackers = {name: ForeignFlowTracker(name, self.extra_settings) for name in ("3y", "10y")}
         self.curve_tracker = CashCurveTracker()
+        self.flow_history: ForeignHistoryReplay | None = None
+        self.flow_catchup_end: int | None = None
+
+    def _ingest_foreign_row(self, row: dict[str, object], timestamp: datetime) -> None:
+        session = row.get("session_id") or timestamp_kst(timestamp).date()
+        for name, tracker in self.foreign_trackers.items():
+            raw_source_time = row.get(f"{name}_foreign_time")
+            source_time = source_timestamp(raw_source_time, timestamp)
+            if raw_source_time in (None, "") or (source_time is not None and
+                    abs((timestamp.astimezone(timezone.utc) - source_time).total_seconds())
+                    <= self.extra_settings.max_source_age_seconds):
+                tracker.update(row, timestamp, session)
+            else:
+                tracker.pause()
+
+    def _restore_foreign_history(self) -> None:
+        history = self.flow_history
+        if history is None:
+            return
+        today = timestamp_kst(datetime.now(timezone.utc)).date()
+        for raw in history.read_batch():
+            try:
+                row = validated_row(numeric_row(raw))
+                timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
+                if timestamp_kst(timestamp).date() != today or timestamp > datetime.now(timezone.utc):
+                    raise ValueError("Outside current trading day")
+                self._ingest_foreign_row(row, timestamp)
+            except (KeyError, ValueError, TypeError, OverflowError):
+                for tracker in self.foreign_trackers.values():
+                    tracker.pause()
+        if history.done:
+            self.flow_history = None
+            self.flow_catchup_end = history.path.stat().st_size
 
     def _alert_summary(self) -> str:
         enabled = sum(rule.enabled for rule in self.extra_settings.rules)
@@ -274,8 +345,12 @@ class Dashboard(tk.Tk):
         parts = []
         if "futures_spread" in metrics:
             parts.append(f"선물 체결가 10Y−3Y {metrics['futures_spread']:+.3f}pt")
+        else:
+            parts.append("선물 체결가 10Y−3Y N/A")
         if "cash_spread_bp" in metrics:
             parts.append(f"현물 체결수익률 10Y−3Y {metrics['cash_spread_bp']:+.1f}bp")
+        else:
+            parts.append("현물 체결수익률 10Y−3Y N/A")
         if not parts:
             return "체결가차: 추가 RTD 미연결"
         source_time = "원천시각 미연결, 수집시각 기준"
@@ -331,7 +406,7 @@ class Dashboard(tk.Tk):
     def _curve_text(self) -> tuple[str, str]:
         summary = self.curve_tracker.summary()
         if summary is None:
-            return "현물 10Y−3Y: 추가 RTD 대기", "5·15분 변화: 기준 데이터 대기"
+            return "현물 10Y−3Y: N/A · RTD 금리 대기", "5·15분 변화: 기준 데이터 대기"
         positions = []
         for minutes in (5, 60):
             point = summary[f"location_{minutes}m"]
@@ -356,8 +431,8 @@ class Dashboard(tk.Tk):
         metrics = market_metrics(row) if row else {}
         for key, label in self.kpis.items():
             value = metrics.get(key)
-            rendered = "—" if value is None else (f"{value:+.1f}" if key.endswith("_spread_bp")
-                       else f"{value:.3f}")
+            rendered = ("N/A" if row else "—") if value is None else (
+                f"{value:+.1f}" if key.endswith("_spread_bp") else f"{value:.3f}")
             label.config(text=rendered, fg=INK if fresh else MUTED)
         self.sizing.config(text=self._sizing_text())
         core = self.core_result or {}
@@ -396,12 +471,22 @@ class Dashboard(tk.Tk):
     def refresh(self):
         try:
             csv_path = current_csv()
+            if self.flow_history is not None:
+                self._restore_foreign_history()
+                if self.flow_history is not None:
+                    self.status.config(text=f"오늘 외국인 수급 복원 중 · {self.flow_history.rows_read:,}행", fg=MUTED)
+                    self.after(25, self.refresh)
+                    return
             if not self.pending_rows:
+                start_offset = self.tail.offset
                 rows, reset = self.tail.read_new(csv_path)
                 if reset:
                     self._reset_analyzers()
+                    if csv_path.is_file():
+                        self.flow_history = ForeignHistoryReplay(csv_path, self.tail.offset)
                 self.pending_rows.extend(rows)
-                self.replaying = reset
+                self.replaying = reset or (self.flow_catchup_end is not None
+                                           and start_offset < self.flow_catchup_end)
             alert_events = []
             deadline = perf_counter() + .020
             processed = 0
@@ -435,16 +520,7 @@ class Dashboard(tk.Tk):
                     self.curve_tracker.update(row)
                 else:
                     self.curve_tracker.reset()
-                session = row.get("session_id") or timestamp_kst(timestamp).date()
-                for name, tracker in self.foreign_trackers.items():
-                    raw_source_time = row.get(f"{name}_foreign_time")
-                    source_time = source_timestamp(raw_source_time, timestamp)
-                    if raw_source_time in (None, "") or (source_time is not None and
-                            abs((timestamp.astimezone(timezone.utc) - source_time).total_seconds())
-                            <= self.extra_settings.max_source_age_seconds):
-                        tracker.update(row, timestamp, session)
-                    else:
-                        tracker.reset()
+                self._ingest_foreign_row(row, timestamp)
                 age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
                 if not self.replaying:
                     metrics = market_metrics(row)
@@ -453,6 +529,8 @@ class Dashboard(tk.Tk):
                                  for metric in metrics}
                     alert_events.extend(self.alert_engine.update(
                         metrics, timestamp, freshness))
+            if self.flow_catchup_end is not None and self.tail.offset >= self.flow_catchup_end and not self.pending_rows:
+                self.flow_catchup_end = None
             if alert_events:
                 last = alert_events[-1]
                 self.notifier.notify(self.winfo_id())
@@ -522,7 +600,7 @@ class Dashboard(tk.Tk):
             self.basis.config(text="수동 적정가 비교: 오류로 중단")
             self.cost.config(text="비용필터: 오류로 중단")
             self._clear_market_display()
-        self.after(25 if self.pending_rows else 500, self.refresh)
+        self.after(25 if self.pending_rows or self.flow_history is not None else 500, self.refresh)
 
     def _clear_market_display(self) -> None:
         for label in self.labels.values():

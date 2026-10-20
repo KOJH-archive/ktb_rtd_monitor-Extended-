@@ -26,14 +26,19 @@ def optional_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def positive_optional_number(value: object) -> float | None:
+    number = optional_number(value)
+    return number if number is not None and number > 0 else None
+
+
 def market_metrics(row: dict[str, object]) -> dict[str, float]:
     result: dict[str, float] = {}
-    price3 = optional_number(row.get("3y_trade_price"))
-    price10 = optional_number(row.get("10y_trade_price"))
-    cash3 = optional_number(row.get("cash_3y_yield_pct"))
-    cash10 = optional_number(row.get("cash_10y_yield_pct"))
-    futures_yield3 = optional_number(row.get("3y_futures_yield_pct"))
-    futures_yield10 = optional_number(row.get("10y_futures_yield_pct"))
+    price3 = positive_optional_number(row.get("3y_trade_price"))
+    price10 = positive_optional_number(row.get("10y_trade_price"))
+    cash3 = positive_optional_number(row.get("cash_3y_yield_pct"))
+    cash10 = positive_optional_number(row.get("cash_10y_yield_pct"))
+    futures_yield3 = positive_optional_number(row.get("3y_futures_yield_pct"))
+    futures_yield10 = positive_optional_number(row.get("10y_futures_yield_pct"))
     if price3 is not None:
         result["3y_trade_price"] = price3
     if price10 is not None:
@@ -138,9 +143,12 @@ class AlertEngine:
                fresh: bool | dict[str, bool]) -> list[AlertEvent]:
         events = []
         for rule in self.rules:
-            if not rule.enabled or rule.metric not in metrics:
+            if not rule.enabled:
                 continue
             state = self.states[rule.name]
+            if rule.metric not in metrics:
+                state.candidate_since = None
+                continue
             value = metrics[rule.metric]
             metric_fresh = fresh.get(rule.metric, False) if isinstance(fresh, dict) else fresh
             if not metric_fresh:
@@ -311,6 +319,7 @@ class ForeignFlowTracker:
     def __init__(self, contract: str, settings: ExtraSettings) -> None:
         self.contract, self.settings = contract, settings
         self.previous: tuple[float, float] | None = None
+        self.last_observed: tuple[float, float] | None = None
         self.previous_time: datetime | None = None
         self.started_time: datetime | None = None
         self.session = None
@@ -321,24 +330,37 @@ class ForeignFlowTracker:
     def reset(self, buy: float | None = None, sell: float | None = None,
               timestamp: datetime | None = None, session=None) -> None:
         self.previous = (buy, sell) if buy is not None and sell is not None else None
+        self.last_observed = self.previous
         self.previous_time, self.started_time, self.session = timestamp, timestamp, session
         self.buy, self.sell = _Side(), _Side()
         self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
         self.resets += 1
 
+    def pause(self) -> None:
+        """Keep observed session zones, but never price a gap's unknown fills."""
+        self.previous = self.previous_time = self.started_time = None
+        self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
+
     def update(self, row: dict[str, object], timestamp: datetime, session) -> None:
         buy = optional_number(row.get(f"{self.contract}_foreign_buy"))
         sell = optional_number(row.get(f"{self.contract}_foreign_sell"))
-        price = optional_number(row.get(f"{self.contract}_trade_price"))
-        yield_pct = optional_number(row.get(f"{self.contract}_futures_yield_pct"))
+        price = positive_optional_number(row.get(f"{self.contract}_trade_price"))
+        yield_pct = positive_optional_number(row.get(f"{self.contract}_futures_yield_pct"))
         if buy is None or sell is None or price is None or min(buy, sell) < 0:
-            self.reset()
+            self.pause()
             return
-        if (self.previous is None or session != self.session or self.previous_time is None
-                or timestamp <= self.previous_time
-                or (timestamp - self.previous_time).total_seconds() > self.settings.flow_max_gap_seconds
-                or buy < self.previous[0] or sell < self.previous[1]):
+        if self.session is not None and session != self.session:
             self.reset(buy, sell, timestamp, session)
+            return
+        if self.last_observed is not None and (buy < self.last_observed[0] or sell < self.last_observed[1]):
+            self.reset(buy, sell, timestamp, session)
+            return
+        if (self.previous is None or self.previous_time is None
+                or timestamp <= self.previous_time
+                or (timestamp - self.previous_time).total_seconds() > self.settings.flow_max_gap_seconds):
+            self.pause()
+            self.previous, self.previous_time, self.started_time, self.session = (buy, sell), timestamp, timestamp, session
+            self.last_observed = (buy, sell)
             return
         buy_change, sell_change = buy - self.previous[0], sell - self.previous[1]
         self.buy.add(buy_change, price, yield_pct, self.settings.price_bin_points)
@@ -346,6 +368,7 @@ class ForeignFlowTracker:
         for window in self.windows.values():
             window.add(timestamp, buy_change, sell_change, price)
         self.previous, self.previous_time, self.session = (buy, sell), timestamp, session
+        self.last_observed = (buy, sell)
 
     def summary(self) -> dict[str, object]:
         windows = ({minutes: window.summary(self.previous_time, self.started_time)

@@ -135,7 +135,12 @@ class ExcelRtdReader:
                 raise FeedUnavailable("Unexpected C2:O11 shape")
             row: dict[str, object] = {"timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
             for name, offset in (("3y", 0), ("10y", 8)):
-                row[f"{name}_trade_price"] = _numbers([block[0][offset + 4]], f"{name} trade price", 1)[0]
+                trade_price = block[0][offset + 4]
+                try:
+                    trade_price = float(trade_price) if not isinstance(trade_price, bool) else float("nan")
+                except (TypeError, ValueError):
+                    trade_price = float("nan")
+                row[f"{name}_trade_price"] = trade_price if math.isfinite(trade_price) and trade_price > 0 else ""
                 row.update(_metrics(name, [values[offset + 1] for values in block[5:]],
                                     [values[offset + 2] for values in block[5:]],
                                     [values[offset + 1] for values in block[:5]],
@@ -179,6 +184,8 @@ class ExcelRtdReader:
         result: dict[str, object] = {}
         numeric = {"cash_3y_yield_pct", "cash_10y_yield_pct", "3y_foreign_buy", "3y_foreign_sell",
                    "10y_foreign_buy", "10y_foreign_sell", "3y_futures_yield_pct", "10y_futures_yield_pct"}
+        yields = {"cash_3y_yield_pct", "cash_10y_yield_pct",
+                  "3y_futures_yield_pct", "10y_futures_yield_pct"}
         for sheet_name, bindings in groups.items():
             sheet = self._sheet if sheet_name == self.sheet_name else self._sheet.book.sheets[sheet_name]
             positions = {key: self._cell_parts(binding.cell) for key, binding in bindings}
@@ -191,16 +198,17 @@ class ExcelRtdReader:
             for key, (row_number, column_number) in positions.items():
                 value = values[row_number - top][column_number - left]
                 if key in numeric:
-                    if value in (None, ""):
+                    if value in (None, "") or isinstance(value, bool):
                         result[key] = ""
                         continue
-                    if isinstance(value, bool):
-                        raise FeedUnavailable(f"{key}: boolean RTD value")
-                    number = float(value)
-                    minimum = 0 if "foreign" in key else 1e-12
-                    if not math.isfinite(number) or number < minimum:
-                        raise FeedUnavailable(f"{key}: invalid RTD value {value!r}")
-                    result[key] = number
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        number = float("nan")
+                    # Optional RTD fields must not discard otherwise valid quotes.
+                    # Zero is a valid foreign-volume count, but not a yield.
+                    result[key] = (number if math.isfinite(number) and
+                                   (number > 0 if key in yields else number >= 0) else "")
                 else:
                     result[key] = "" if value is None else str(value).strip()
         return result
@@ -330,8 +338,10 @@ def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, fl
         print("\033[2J\033[H", end="")
     print(f"KTB RTD monitor  |  {row['timestamp_utc']}  |  {interval_ms} ms")
     for name in ("3y", "10y"):
+        trade = row[name + "_trade_price"]
+        trade_text = f"{float(trade):.3f}" if trade not in (None, "") else "N/A"
         print(f"{name.upper():>3}  bid {row[name+'_best_bid']:.3f}  ask {row[name+'_best_ask']:.3f}  "
-              f"mid {row[name+'_mid']:.3f}  trade {row[name+'_trade_price']:.3f}  spr {row[name+'_spread']:.3f}")
+              f"mid {row[name+'_mid']:.3f}  trade {trade_text}  spr {row[name+'_spread']:.3f}")
         print(f"     OBI {row[name+'_obi']:+.3f}  WOBI {row[name+'_weighted_obi']:+.3f}  "
               f"micro {row[name+'_microprice']:.4f}  depth B/A {row[name+'_bid_depth']:.0f}/{row[name+'_ask_depth']:.0f}")
     if rv is not None:
