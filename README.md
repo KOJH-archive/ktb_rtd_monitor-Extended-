@@ -83,10 +83,10 @@ python .\import_cash_yields.py '.\기획팀\한국채_금리_조회결과.xlsx' 
 .\.venv32\Scripts\python.exe .\ktb_rtd_monitor.py --interval-ms 250 --output-dir .\data --log both --no-clear
 ```
 
-최근 로그 분석:
+보조 분석·백테스트는 BAT 파일 없이 필요할 때 Python으로 실행합니다. 아래 예시의 CSV 경로는 분석하려는 저장 파일로 바꾸세요.
 
 ```powershell
-.\.venv32\Scripts\python.exe .\analyze_snapshots.py .\data\snapshots_with_trades.csv --window 120 --beta 2.88
+.\.venv32\Scripts\python.exe .\analyze_snapshots.py .\data\snapshots_enhanced_YYYYMMDD.csv --window 120 --beta 2.88
 ```
 
 ## 주요 파일
@@ -104,7 +104,7 @@ python .\import_cash_yields.py '.\기획팀\한국채_금리_조회결과.xlsx' 
 - `paper_backtest.py`: 저장된 호가를 동일한 실시간 신호 로직으로 재생
 - `test_metrics.py`: 단위 테스트
 - `requirements.txt`: Python 의존성
-- `DEVELOPMENT_LOG.md`: 전체 개발 내역과 한계
+- `docs/DEVELOPMENT_LOG.md`: 전체 개발 내역과 한계
 - `settings.json`: RV 창·임계값 및 계약별 DV01 입력
 
 ## 저부하 동작
@@ -140,10 +140,10 @@ python .\import_cash_yields.py '.\기획팀\한국채_금리_조회결과.xlsx' 
 
 ## 페이퍼 백테스트
 
-`페이퍼_백테스트.bat`은 임의 접미사가 붙은 새 CSV를 생성하고 기존 결과는 덮어쓰지 않습니다. 신호 이후 다음 관측 bid/ask를 가상 체결에 사용하며, 데이터 단절/끝의 미청산 평가는 청산 손익과 구분합니다. 평균과의 거리가 설정 비용 배수보다 작으면 연구 진입을 보류하지만 그 거리는 기대수익이 아닙니다. 잔량·부분체결·지연·정수 수량·시장충격·증거금·펀딩 모델은 없습니다. 추가비용 기본값은 0입니다.
+`paper_backtest.py`는 지정한 저장 CSV를 읽고, 기존 파일을 덮어쓰지 않는 출력 경로를 직접 지정해 실행합니다. 신호 이후 다음 관측 bid/ask를 가상 체결에 사용하며, 데이터 단절/끝의 미청산 평가는 청산 손익과 구분합니다. 평균과의 거리가 설정 비용 배수보다 작으면 연구 진입을 보류하지만 그 거리는 기대수익이 아닙니다. 잔량·부분체결·지연·정수 수량·시장충격·증거금·펀딩 모델은 없습니다. 추가비용 기본값은 0입니다.
 
 ```powershell
-.\.venv32\Scripts\python.exe .\paper_backtest.py .\data\snapshots_with_trades.csv --settings .\settings.json --output .\data\paper_trades_new.csv
+.\.venv32\Scripts\python.exe .\paper_backtest.py .\data\snapshots_enhanced_YYYYMMDD.csv --settings .\settings.json --output .\data\paper_trades_new.csv
 ```
 
 ## RV 해석 기준
@@ -179,4 +179,4 @@ RV z-score = (현재 RV level - rolling 평균) / rolling 표준편차
 
 기본 beta `2.88`은 초기값입니다. 실제 연구에는 계약별 DV01로 hedge ratio를 계산해야 합니다. OBI/WOBI와 z-score 임계값은 아직 국채선물 데이터로 검증된 매매 기준이 아닙니다.
 
-자세한 상태와 다음 작업은 [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md)를 참고하세요.
+자세한 상태와 다음 작업은 [DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md)를 참고하세요.

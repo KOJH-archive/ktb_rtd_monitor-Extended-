@@ -36,7 +36,7 @@ Windows Excel의 CheckExpert RTD로 한국 국채선물 3Y/10Y 데이터를 읽�
 
 - `실시간_호가_시작.bat`: 실시간 수집
 - `대시보드_시작.bat`: 대시보드
-- `최근로그_분석.bat`: 최근 로그 분석
+- 최근 로그 분석 보조 BAT는 정리됨; 필요 시 `analyze_snapshots.py`를 직접 실행
 
 Excel에서 `국채선물 호가창.xlsx`를 먼저 열고 RTD 값이 표시되는지 확인한 뒤 수집기를 실행한다.
 
