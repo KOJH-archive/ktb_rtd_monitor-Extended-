@@ -17,7 +17,8 @@ from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, lo
 from dashboard import AlertEditor, Dashboard, ForeignHistoryReplay, IncrementalCsvTail, current_csv
 from decision_support import OrderFlowAnalyzer, risk_metrics
 from extra_settings import AlertRule, ExtraSettings, parse_settings
-from ktb_rtd_monitor import ExcelRtdReader, FeedUnavailable, SnapshotLogger, _numbers
+from ktb_rtd_monitor import (ExcelConnectionUnavailable, ExcelRtdReader, FeedUnavailable,
+                             PollSchedule, SnapshotLogger, _numbers)
 from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
                                market_metrics, metric_is_fresh, source_timestamp)
 from paper_backtest import replay
@@ -38,6 +39,25 @@ def quote(seconds=0, mid10=100.0):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_excel_connection_backoff_and_quote_error_cadence(self):
+        cadence = PollSchedule(1000)
+        self.assertEqual(cadence.normal_seconds, 1)
+        self.assertEqual([cadence.failure(True) for _ in range(4)], [3, 4, 5, 5])
+        self.assertEqual(cadence.failure(False), 1)
+        self.assertEqual(cadence.failure(True), 3)
+        self.assertEqual(cadence.success(), 1)
+        self.assertEqual(cadence.failure(True), 3)
+
+    def test_excel_com_failure_is_distinct_from_invalid_quote(self):
+        reader = ExcelRtdReader("unused", "Sheet1")
+        sheet = MagicMock()
+        sheet.range.side_effect = RuntimeError("COM unavailable")
+        reader._sheet = sheet
+        with self.assertRaises(ExcelConnectionUnavailable):
+            reader.snapshot()
+        self.assertIsNone(reader._sheet)
+        self.assertFalse(isinstance(FeedUnavailable("bad quote"), ExcelConnectionUnavailable))
+
     def test_alert_editor_deletes_selected_rules_and_saves_remaining_settings(self):
         for selected, expected in (((0, 2), ["b"]), ((0, 1, 2), [])):
             with self.subTest(selected=selected), tempfile.TemporaryDirectory(dir=ROOT) as folder:

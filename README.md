@@ -8,7 +8,7 @@
 - [개발명세서: 기술스택·논리구조·계산식·설정](docs/DEVELOPMENT_SPEC.md)
 - [최종 점검·리팩토링·검증 결과](docs/FINAL_REVIEW.md)
 
-한국 국채선물 3Y/10Y의 Excel RTD 실시간 호가와 시장 체결가를 Python으로 수집·분석하는 관찰용 프로토타입입니다. 자동주문·주문 API·실거래 기능은 포함하지 않습니다. 실시간 수집은 250ms로 유지하되, 중복 호가는 5초 heartbeat로 축약하고 CSV·SQLite는 1초 단위로 묶어 저장합니다.
+한국 국채선물 3Y/10Y의 Excel RTD 실시간 호가와 시장 체결가를 Python으로 수집·분석하는 관찰용 프로토타입입니다. 자동주문·주문 API·실거래 기능은 포함하지 않습니다. 수동 주문 운영에 맞춰 Excel은 기본 1초마다 읽고, 중복 호가는 5초 heartbeat로 축약하며 CSV·SQLite는 1초 단위로 묶어 저장합니다. Excel 연결·읽기 오류가 연속되면 3→4→5초(최대 5초) 간격으로 재시도하고, 정상 관측이 돌아오면 1초로 복귀합니다.
 
 ## 빠른 실행
 
@@ -80,7 +80,7 @@ python .\import_cash_yields.py '.\기획팀\한국채_금리_조회결과.xlsx' 
 ## 수동 실행
 
 ```powershell
-.\.venv32\Scripts\python.exe .\ktb_rtd_monitor.py --interval-ms 250 --output-dir .\data --log both --no-clear
+.\.venv32\Scripts\python.exe .\ktb_rtd_monitor.py --interval-ms 1000 --output-dir .\data --log both --no-clear
 ```
 
 보조 분석·백테스트는 BAT 파일 없이 필요할 때 Python으로 실행합니다. 아래 예시의 CSV 경로는 분석하려는 저장 파일로 바꾸세요.
@@ -109,11 +109,13 @@ python .\import_cash_yields.py '.\기획팀\한국채_금리_조회결과.xlsx' 
 
 ## 저부하 동작
 
-- Excel RTD polling: 250ms (기존 유지)
+- Excel RTD polling: 정상 시 1초(100~2000ms 설정 가능), 연결 오류가 연속되면 3→4→5초 간격 재시도
 - 로그: 호가나 체결가가 바뀌면 즉시 기록, 변화가 없으면 5초마다 상태 기록
 - 디스크 반영: CSV와 SQLite를 1초 단위로 묶어 반영
 - 대시보드: 시작할 때 최근 행만 읽고 이후에는 새로 추가된 행만 분석
 - 콘솔: 클릭 실행에서는 매 polling 출력하지 않고 오류만 `launcher.log`에 남김
+
+수집 간격을 늘려도 CheckExpert RTD 자체의 끊김이나 공급값 동결을 해결했다고 볼 수는 없습니다. 1초 사이에 잠깐 닿은 가격은 놓칠 수 있으며, 알림은 관측된 값에 대해서만 동작합니다. 0 호가처럼 Excel 연결은 유지됐지만 시세가 유효하지 않은 경우에는 연결 오류 백오프가 아니라 정상 1초 주기로 재확인합니다.
 
 모든 polling 행이 필요한 진단 상황에서는 `--log-all`을 추가할 수 있습니다.
 

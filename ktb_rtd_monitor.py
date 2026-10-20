@@ -38,6 +38,29 @@ class FeedUnavailable(RuntimeError):
     """Excel is unavailable, or its RTD cells do not currently hold usable values."""
 
 
+class ExcelConnectionUnavailable(FeedUnavailable):
+    """Excel/COM could not be reached; retry less often than a bad RTD cell."""
+
+
+class PollSchedule:
+    """Normal polling and bounded backoff for consecutive Excel read failures."""
+
+    def __init__(self, interval_ms: int) -> None:
+        self.normal_seconds = interval_ms / 1000
+        self.connection_failures = 0
+
+    def success(self) -> float:
+        self.connection_failures = 0
+        return self.normal_seconds
+
+    def failure(self, connection_error: bool) -> float:
+        if not connection_error:
+            self.connection_failures = 0
+            return self.normal_seconds
+        self.connection_failures += 1
+        return float(min(5, 2 + self.connection_failures))
+
+
 @dataclass(frozen=True)
 class ContractLayout:
     name: str
@@ -123,8 +146,8 @@ class ExcelRtdReader:
                     try:
                         return book.sheets[self.sheet_name]
                     except KeyError as exc:
-                        raise FeedUnavailable(f"Sheet {self.sheet_name!r} is not open in {book.name!r}") from exc
-        raise FeedUnavailable(f"Open {self.workbook_name!r} in desktop Excel first (with the RTD add-in connected).")
+                        raise ExcelConnectionUnavailable(f"Sheet {self.sheet_name!r} is not open in {book.name!r}") from exc
+        raise ExcelConnectionUnavailable(f"Open {self.workbook_name!r} in desktop Excel first (with the RTD add-in connected).")
 
     def snapshot(self) -> dict[str, object]:
         try:
@@ -156,7 +179,7 @@ class ExcelRtdReader:
             self._sheet = None
             if isinstance(exc, FeedUnavailable):
                 raise
-            raise FeedUnavailable(f"Excel read failed: {exc}") from exc
+            raise ExcelConnectionUnavailable(f"Excel read failed: {exc}") from exc
 
     @staticmethod
     def _cell_parts(address: str) -> tuple[int, int]:
@@ -356,7 +379,8 @@ def main() -> int:
     parser.add_argument("--workbook", default="국채선물 호가창.xlsx")
     parser.add_argument("--sheet", default="Sheet1")
     parser.add_argument("--extra-settings", type=Path, default=Path("extra_settings.json"))
-    parser.add_argument("--interval-ms", type=int, default=250, choices=range(100, 501))
+    parser.add_argument("--interval-ms", type=int, default=1000,
+                        help="Normal Excel polling interval in ms (100-2000; default: 1000)")
     parser.add_argument("--output-dir", type=Path, default=Path("data"))
     parser.add_argument("--log", choices=("csv", "sqlite", "both"), default="both")
     parser.add_argument("--flush-ms", type=int, default=1000,
@@ -367,6 +391,8 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true", help="Do not print every snapshot")
     parser.add_argument("--no-clear", action="store_true", help="Do not emit ANSI screen-clear codes")
     args = parser.parse_args()
+    if not 100 <= args.interval_ms <= 2000:
+        parser.error("--interval-ms must be between 100 and 2000")
     if args.flush_ms < 100: parser.error("--flush-ms must be at least 100")
     if not math.isfinite(args.heartbeat_seconds) or args.heartbeat_seconds <= 0:
         parser.error("--heartbeat-seconds must be finite and positive")
@@ -377,10 +403,13 @@ def main() -> int:
     log_day: str | None = None
     throttle = SnapshotThrottle(args.heartbeat_seconds)
     rv_state = RollingRV()
+    poll_schedule = PollSchedule(args.interval_ms)
     last_error_times: dict[str, float] = {}
     try:
         while True:
             started = time.perf_counter()
+            next_interval = poll_schedule.normal_seconds
+            connection_error = False
             try:
                 row = reader.snapshot()
                 rv = None if args.quiet else rv_state.update(row)
@@ -401,16 +430,21 @@ def main() -> int:
                 if not args.quiet:
                     display(row, args.interval_ms, rv, not args.no_clear)
                 last_error_times.clear()
+                next_interval = poll_schedule.success()
             except FeedUnavailable as exc:
+                connection_error = isinstance(exc, ExcelConnectionUnavailable)
+                next_interval = poll_schedule.failure(connection_error)
                 message = str(exc)
                 now = time.monotonic()
                 if now - last_error_times.get(message, -float("inf")) >= 60:
-                    print(f"[waiting for Excel] {exc}", file=sys.stderr)
+                    stamp = timestamp_kst(datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S KST")
+                    print(f"[{stamp}] [waiting for Excel; retry {next_interval:g}s] {exc}", file=sys.stderr)
                     last_error_times[message] = now
             finally:
                 if logger is not None:
                     logger.flush()
-            time.sleep(max(0.0, args.interval_ms / 1000 - (time.perf_counter() - started)))
+            time.sleep(next_interval if connection_error else
+                       max(0.0, next_interval - (time.perf_counter() - started)))
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
