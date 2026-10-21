@@ -15,6 +15,7 @@ from signal_engine import SignalEngine, validated_row
 from curve_context import CashCurveTracker
 from cash_risk import load_cash_days, target_packages
 from futures_dv01 import futures_dv01_pair
+from relative_value import RelativeValueTracker, relative_execution_cost
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -195,6 +196,8 @@ class Dashboard(tk.Tk):
         self.notifier = WindowsNotifier(self.extra_settings)
         self.foreign_trackers = {name: ForeignFlowTracker(name, self.extra_settings) for name in ("3y", "10y")}
         self.curve_tracker = CashCurveTracker()
+        self.relative_tracker = RelativeValueTracker()
+        self.relative_result: dict[str, object] | None = None
         self.flow_history: ForeignHistoryReplay | None = None
         self.flow_catchup_end: int | None = None
         self.risk_window_started_at: datetime | None = None
@@ -256,6 +259,15 @@ class Dashboard(tk.Tk):
             else:
                 tracker.pause()
 
+    def _update_relative_value(self, row: dict[str, object], timestamp: datetime) -> None:
+        metrics = market_metrics(row)
+        if ("cross_basis_bp" in metrics
+                and metric_is_fresh(row, "cross_basis_bp", timestamp, self.extra_settings)):
+            self.relative_result = self.relative_tracker.update(row)
+        else:
+            self.relative_tracker.pause()
+            self.relative_result = None
+
     def _restore_foreign_history(self) -> None:
         history = self.flow_history
         if history is None:
@@ -271,6 +283,7 @@ class Dashboard(tk.Tk):
                 self.fast_result, self.core_result = result.fast, result.core
                 self._record_risk_progress(result, row)
                 self._ingest_foreign_row(row, timestamp)
+                self._update_relative_value(row, timestamp)
             except (KeyError, ValueError, TypeError, OverflowError):
                 # A malformed historical row breaks continuity but should not
                 # erase valid same-day observations recovered before it.
@@ -284,6 +297,8 @@ class Dashboard(tk.Tk):
                 self.risk_reset_reason = "invalid_row"
                 for tracker in self.foreign_trackers.values():
                     tracker.pause()
+                self.relative_tracker.pause()
+                self.relative_result = None
         if history.done:
             # Historical observations warm only the volatility/RV windows. A
             # historical consensus state is never carried into live decisions.
@@ -525,6 +540,72 @@ class Dashboard(tk.Tk):
             trend += f" | {direction}"
         return (f"현재 {summary['spread_bp']:+.1f}bp\n" + "\n".join(positions), trend)
 
+    def _relative_value_texts(self, row: dict[str, object], timestamp: datetime) -> tuple[str, str, str]:
+        metrics = market_metrics(row)
+        butterfly = metrics.get("cash_butterfly_bp")
+        butterfly_fresh = (butterfly is not None and
+                           metric_is_fresh(row, "cash_butterfly_bp", timestamp, self.extra_settings))
+        if butterfly_fresh:
+            curve = (f"현물 5Y 곡률 {float(butterfly):+.2f}bp\n"
+                     "5Y − (5/7×3Y + 2/7×10Y) · 선형 만기보간 기준")
+            if not any(row.get(key) not in (None, "")
+                       for key in ("cash_3y_time", "cash_5y_time", "cash_10y_time")):
+                curve += "\n원천시각 미연결 · 수집시각 기준"
+        elif butterfly is None:
+            curve = "현물 5Y 금리 미연결 · cash_5y_yield_pct 입력 필요"
+        else:
+            curve = "현물 3·5·10년 원천시각 불일치/지연 · 곡률 사용 중지"
+
+        fresh = {key: key in metrics and metric_is_fresh(row, key, timestamp, self.extra_settings)
+                 for key in ("basis_3y_bp", "basis_10y_bp", "cross_basis_bp")}
+        if fresh["basis_3y_bp"] and fresh["basis_10y_bp"] and fresh["cross_basis_bp"]:
+            basis = (f"3Y 현선물 {metrics['basis_3y_bp']:+.2f}bp | "
+                     f"10Y 현선물 {metrics['basis_10y_bp']:+.2f}bp\n"
+                     f"교차 베이시스 {metrics['cross_basis_bp']:+.2f}bp "
+                     "= (10Y 선물−현물) − (3Y 선물−현물)")
+            contracts = (f"3Y {row.get('3y_contract')} / 10Y {row.get('10y_contract')}"
+                         if row.get("3y_contract") and row.get("10y_contract") else "계약월 미연결")
+            timing = ("원천시각 미연결 · 수집시각 기준"
+                      if not any(row.get(key) not in (None, "") for key in
+                                 ("3y_trade_time", "10y_trade_time", "cash_3y_time", "cash_10y_time"))
+                      else "연결된 원천시각 검사 통과")
+            basis += f"\n{contracts} | {timing}"
+        elif "cross_basis_bp" not in metrics:
+            basis = "3Y·10Y 현물금리와 선물수익률 연결 대기"
+        else:
+            basis = "현물·선물 원천시각 불일치/지연 · 교차 베이시스 사용 중지"
+
+        result = self.relative_result
+        if not result or result.get("reference_mean_bp") is None:
+            stats = "60분 기준 분봉 관측 준비 중"
+        else:
+            samples = int(result["samples"])
+            zscore = result.get("zscore")
+            half_life = result.get("half_life_minutes")
+            ztext = "준비 중" if zscore is None else f"{float(zscore):+.2f}"
+            half = "추정 불가" if half_life is None else f"{float(half_life):.1f}분"
+            stats = (f"완료 분 기준 평균 {float(result['reference_mean_bp']):+.2f}bp | "
+                     f"표준편차 {float(result['reference_stdev_bp'] or 0):.2f}bp | z {ztext}\n"
+                     f"관측 반감기 {half} | 표본 {samples}/{int(result['required_samples'])} "
+                     f"| 최근 연속 {int(result['continuous_samples'])}분")
+
+        cost = relative_execution_cost(row, self.settings.risk)
+        if cost is None:
+            execution = stats + "\nDV01 또는 호가 간격 대기 · 비용 판정 불가"
+        else:
+            status = "통계 기준 준비 중"
+            if result and result.get("reference_mean_bp") is not None and result.get("zscore") is not None:
+                deviation = abs(float(result["cross_basis_bp"]) - float(result["reference_mean_bp"]))
+                required = (float(cost["break_even_cross_basis_bp"])
+                            * self.settings.execution.min_edge_to_roundtrip_cost)
+                status = ("비용 초과 상대가치 괴리 관측 · 매매 신호 아님"
+                          if abs(float(result["zscore"])) >= self.settings.rv.entry_z and deviation >= required
+                          else "호가비용·통계 기준 미충족")
+            execution = (stats + f"\nDV01 중립 정수 패키지 3Y {cost['contracts_3y']} / 10Y {cost['contracts_10y']} "
+                         f"| 왕복 호가비용 약 {float(cost['roundtrip_cost_krw']):,.0f}원 "
+                         f"| 손익분기 약 {float(cost['break_even_cross_basis_bp']):.2f}bp\n{status}")
+        return curve, basis, execution
+
     def _render_overview(self, row: dict[str, object] | None, fresh: bool) -> None:
         metrics = market_metrics(row) if row else {}
         for key, label in self.kpis.items():
@@ -643,6 +724,7 @@ class Dashboard(tk.Tk):
                     self.curve_tracker.update(row)
                 else:
                     self.curve_tracker.reset()
+                self._update_relative_value(row, timestamp)
                 self._ingest_foreign_row(row, timestamp)
                 age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
                 if not self.replaying:
@@ -689,6 +771,10 @@ class Dashboard(tk.Tk):
                 curve_position, curve_trend = self._curve_text()
                 self.curve_position.config(text=curve_position)
                 self.curve_trend.config(text=curve_trend)
+                relative_curve, relative_basis, relative_execution = self._relative_value_texts(row, timestamp)
+                self.relative_curve.config(text=relative_curve)
+                self.relative_basis.config(text=relative_basis)
+                self.relative_execution.config(text=relative_execution)
                 self._render_overview(row, fresh)
                 if not fresh and not self.pending_rows:
                     self.flow.config(text="호가잔량 압력: 최신 데이터 대기")
@@ -732,6 +818,9 @@ class Dashboard(tk.Tk):
             label.config(text="유효 데이터 대기")
         self.curve_position.config(text="현물 RTD 데이터 대기")
         self.curve_trend.config(text="5·15분 변화: 기준 데이터 대기")
+        self.relative_curve.config(text="현물 5년 금리 연결 대기")
+        self.relative_basis.config(text="현선물 베이시스 데이터 대기")
+        self.relative_execution.config(text="상대가치 통계·비용 계산 대기")
         self._render_overview(None, False)
 
 

@@ -8,6 +8,11 @@
       "sheet": "추가RTD",
       "cell": "B2"
     },
+    "cash_5y_yield_pct": {
+      "sheet": "추가RTD",
+      "cell": "B11"
+    },
+    "cash_5y_time": null,
     "cash_3y_time": null,
     "cash_10y_time": null,
     "3y_foreign_buy": {
@@ -57,10 +62,10 @@
       "enabled": true
     },
     {
-      "name": "현물 10년−3년 체결수익률차 (bp) 이상 34",
+      "name": "현물 10년−3년 체결수익률차 (bp) 이상 34.5",
       "metric": "cash_spread_bp",
       "mode": "above",
-      "lower": 34.0,
+      "lower": 34.5,
       "upper": null,
       "hysteresis": 0.5,
       "confirmation_seconds": 1,
@@ -68,23 +73,23 @@
       "enabled": true
     },
     {
-      "name": "10년−3년 선물 체결가차 (pt) 이상 29.4",
-      "metric": "futures_spread",
+      "name": "현물 10년−3년 체결수익률차 (bp) 이상 35",
+      "metric": "cash_spread_bp",
       "mode": "above",
-      "lower": 29.4,
+      "lower": 35.0,
       "upper": null,
-      "hysteresis": 0.01,
+      "hysteresis": 0.5,
       "confirmation_seconds": 1,
       "cooldown_seconds": 0,
       "enabled": true
     },
     {
-      "name": "10년−3년 선물 체결가차 (pt) 이하 25.5",
-      "metric": "futures_spread",
+      "name": "현물 10년−3년 체결수익률차 (bp) 이하 27.5",
+      "metric": "cash_spread_bp",
       "mode": "below",
-      "lower": 25.5,
+      "lower": 27.5,
       "upper": null,
-      "hysteresis": 0.01,
+      "hysteresis": 0.5,
       "confirmation_seconds": 1,
       "cooldown_seconds": 0,
       "enabled": true

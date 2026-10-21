@@ -36,6 +36,7 @@ def market_metrics(row: dict[str, object]) -> dict[str, float]:
     price3 = positive_optional_number(row.get("3y_trade_price"))
     price10 = positive_optional_number(row.get("10y_trade_price"))
     cash3 = positive_optional_number(row.get("cash_3y_yield_pct"))
+    cash5 = positive_optional_number(row.get("cash_5y_yield_pct"))
     cash10 = positive_optional_number(row.get("cash_10y_yield_pct"))
     futures_yield3 = positive_optional_number(row.get("3y_futures_yield_pct"))
     futures_yield10 = positive_optional_number(row.get("10y_futures_yield_pct"))
@@ -47,6 +48,15 @@ def market_metrics(row: dict[str, object]) -> dict[str, float]:
         result["futures_spread"] = price10 - price3
     if cash3 is not None and cash10 is not None:
         result["cash_spread_bp"] = (cash10 - cash3) * 100.0
+    if cash3 is not None and cash5 is not None and cash10 is not None:
+        # Linear maturity interpolation at year 5 between years 3 and 10.
+        result["cash_butterfly_bp"] = (cash5 - (5.0 / 7.0 * cash3 + 2.0 / 7.0 * cash10)) * 100.0
+    if futures_yield3 is not None and cash3 is not None:
+        result["basis_3y_bp"] = (futures_yield3 - cash3) * 100.0
+    if futures_yield10 is not None and cash10 is not None:
+        result["basis_10y_bp"] = (futures_yield10 - cash10) * 100.0
+    if "basis_3y_bp" in result and "basis_10y_bp" in result:
+        result["cross_basis_bp"] = result["basis_10y_bp"] - result["basis_3y_bp"]
     if futures_yield3 is not None and futures_yield10 is not None:
         result["futures_yield_spread_bp"] = (futures_yield10 - futures_yield3) * 100.0
     return result
@@ -86,6 +96,11 @@ def metric_is_fresh(row: dict[str, object], metric: str, collector_timestamp: da
     keys = {"futures_spread": ("3y_trade_time", "10y_trade_time"),
             "futures_yield_spread_bp": ("3y_trade_time", "10y_trade_time"),
             "cash_spread_bp": ("cash_3y_time", "cash_10y_time"),
+            "cash_butterfly_bp": ("cash_3y_time", "cash_5y_time", "cash_10y_time"),
+            "basis_3y_bp": ("3y_trade_time", "cash_3y_time"),
+            "basis_10y_bp": ("10y_trade_time", "cash_10y_time"),
+            "cross_basis_bp": ("3y_trade_time", "10y_trade_time",
+                               "cash_3y_time", "cash_10y_time"),
             "3y_trade_price": ("3y_trade_time",), "10y_trade_price": ("10y_trade_time",)}.get(metric)
     if keys is None:
         return False

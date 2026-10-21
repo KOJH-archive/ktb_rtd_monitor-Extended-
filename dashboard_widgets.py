@@ -126,9 +126,9 @@ def build_dashboard(view):
     notebook.pack(fill="both", expand=True)
     view.notebook = notebook
     pages = []
-    for title in ("금리차 위치", "외국인 수급", "변동성 · 위험", "호가 · 비용"):
+    for title in ("금리차 위치", "상대가치", "외국인 수급", "변동성 · 위험", "호가 · 비용"):
         pages.append(scroll_page(notebook, title))
-    curve_page, foreign_page, risk_page, book_page = pages
+    curve_page, relative_page, foreign_page, risk_page, book_page = pages
 
     curve = panel(curve_page, "현물 10년 − 3년 금리차", "최근 체결수익률 차이 · bp · 수집시각 기준")
     curve.pack(fill="x")
@@ -136,6 +136,26 @@ def build_dashboard(view):
     view.curve_trend = row_label(curve, "5·15분 변화: 기준 데이터 대기", size=10)
     row_label(curve, "5분·60분 위치는 완료된 각 분의 마지막 관측값과 비교합니다.\n"
               "추세는 최근 변화 방향만 표시하며, 미래 방향이나 적정가를 예측하지 않습니다.",
+              size=9, color=MUTED)
+
+    relative_curve = panel(relative_page, "01  현물 3−5−10년 곡률",
+                           "5년 현물은 기준점이며 거래 가능한 5년 선물로 간주하지 않습니다.")
+    relative_curve.pack(fill="x")
+    view.relative_curve = row_label(relative_curve, "현물 5년 금리 연결 대기",
+                                    size=11, color=ACCENT, bold=True)
+    row_label(relative_curve, "양수는 5년 금리가 3년·10년 선형보간보다 높은 상태입니다.\n"
+              "곡률은 상대가치 설명변수이며 독립적인 수익 예측이 아닙니다.", size=9, color=MUTED)
+    relative_basis = panel(relative_page, "02  3년·10년 현선물 교차 베이시스",
+                           "선물수익률 − 현물수익률 · bp")
+    relative_basis.pack(fill="x", pady=8)
+    view.relative_basis = row_label(relative_basis, "현선물 베이시스 데이터 대기",
+                                    size=11, bold=True)
+    relative_stats = panel(relative_page, "03  평균회귀 관측 · 실행비용",
+                           "완료 분봉 통계와 현재 최우선 호가 간격 기준")
+    relative_stats.pack(fill="x")
+    view.relative_execution = row_label(relative_stats, "상대가치 통계·비용 계산 대기", size=10)
+    row_label(relative_stats, "반감기는 최근 관측의 AR(1) 적합값이며 구조적 수렴을 보장하지 않습니다.\n"
+              "손익분기 bp는 대칭적인 커브 변화와 양쪽 시장가 왕복을 가정한 연구용 근사치입니다.",
               size=9, color=MUTED)
 
     risk_page.columnconfigure(0, weight=1, uniform="risk")

@@ -1,6 +1,7 @@
 """Offline regression tests; no Excel/COM or real orders."""
 import csv
 import json
+import math
 import tempfile
 import unittest
 from collections import deque
@@ -25,6 +26,7 @@ from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
 from monitor_launcher import (AlreadyRunning, DATA_DIR, PYTHON, InstanceLock,
                               _stop, collector_command)
 from paper_backtest import replay
+from relative_value import RelativeValueTracker, estimate_half_life, relative_execution_cost
 from signal_engine import SignalEngine, SignalResult, validated_row
 
 ROOT = Path(__file__).parent
@@ -118,6 +120,7 @@ class SafetyTests(unittest.TestCase):
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
                                                                "futures_yield_spread_bp", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_ingest_foreign_row", "_restore_foreign_history",
+                       "_update_relative_value", "_relative_value_texts",
                        "_record_risk_progress", "_configure_auto_dv01", "_load_cash_risk", "_risk_text",
                        "_decision_text", "_flow_text", "_basis_text", "_cost_text",
                        "_market_text", "_foreign_text", "_curve_text", "_sizing_text", "_render_overview",
@@ -127,7 +130,8 @@ class SafetyTests(unittest.TestCase):
         view._reset_analyzers()
         for name in ("status", "decision", "fast_rv", "core_rv", "flow", "basis", "cost",
                      "market_spreads", "foreign_3y", "foreign_10y", "alert_status", "volatility",
-                     "window_note", "curve_position", "curve_trend", "sizing", "risk"):
+                     "window_note", "curve_position", "curve_trend", "relative_curve",
+                     "relative_basis", "relative_execution", "sizing", "risk"):
             setattr(view, name, MagicMock())
         view.labels = {(name, key): MagicMock() for name in ("3y", "10y") for key in
                        ("mid", "spread", "obi", "weighted_obi", "microprice", "bid_depth", "ask_depth")}
@@ -280,11 +284,17 @@ class SafetyTests(unittest.TestCase):
         settings = parse_settings(raw)
         self.assertEqual(settings.bindings["cash_3y_yield_pct"].cell, "B1")
         metrics = market_metrics({"3y_trade_price": 102.95, "10y_trade_price": 106.30,
-                                  "cash_3y_yield_pct": 3.861, "cash_10y_yield_pct": 4.188,
+                                  "cash_3y_yield_pct": 3.861, "cash_5y_yield_pct": 4.000,
+                                  "cash_10y_yield_pct": 4.188,
                                   "3y_futures_yield_pct": 3.934, "10y_futures_yield_pct": 4.221})
         self.assertAlmostEqual(metrics["futures_spread"], 3.35)
         self.assertAlmostEqual(metrics["cash_spread_bp"], 32.7)
         self.assertAlmostEqual(metrics["futures_yield_spread_bp"], 28.7)
+        self.assertAlmostEqual(metrics["basis_3y_bp"], 7.3)
+        self.assertAlmostEqual(metrics["basis_10y_bp"], 3.3)
+        self.assertAlmostEqual(metrics["cross_basis_bp"], -4.0)
+        expected_butterfly = (4.000 - (5 / 7 * 3.861 + 2 / 7 * 4.188)) * 100
+        self.assertAlmostEqual(metrics["cash_butterfly_bp"], expected_butterfly)
         self.assertNotIn("futures_yield_spread_bp", market_metrics({"3y_futures_yield_pct": 3.934}))
         self.assertNotIn("cash_spread_bp", market_metrics({"cash_3y_yield_pct": 0,
                                                            "cash_10y_yield_pct": 4.188}))
@@ -299,6 +309,55 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "N/A")
         with self.assertRaises(ValueError):
             parse_settings({"bindings": {"cash_3y_yield_pct": {"sheet": "x", "cell": "B0"}}})
+
+    def test_relative_value_tracker_half_life_and_execution_cost(self):
+        values = [10 * .8 ** index for index in range(25)]
+        self.assertAlmostEqual(estimate_half_life(values), -math.log(2) / math.log(.8), places=8)
+        tracker = RelativeValueTracker(window_minutes=60, min_samples=20)
+        for minute, cross in enumerate(values):
+            row = {"timestamp_utc": (START + timedelta(minutes=minute)).isoformat(),
+                   "cash_3y_yield_pct": 3.0, "cash_10y_yield_pct": 3.3,
+                   "3y_futures_yield_pct": 3.1,
+                   "10y_futures_yield_pct": 3.4 + cross / 100}
+            result = tracker.update(row)
+        self.assertEqual(result["samples"], 24)
+        self.assertIsNotNone(result["zscore"])
+        self.assertAlmostEqual(result["half_life_minutes"], -math.log(2) / math.log(.8), places=8)
+        risk = RiskSettings(dv01_3y_krw_per_bp=30_000, dv01_10y_krw_per_bp=90_000)
+        cost = relative_execution_cost({"3y_spread": .01, "10y_spread": .02}, risk)
+        self.assertEqual(cost["contracts_3y"], 3)
+        self.assertEqual(cost["roundtrip_cost_krw"], 50_000)
+        self.assertAlmostEqual(cost["break_even_cross_basis_bp"], 50_000 / 90_000)
+
+    def test_relative_metrics_require_positive_complete_inputs_and_aligned_times(self):
+        row = {"cash_3y_yield_pct": 3.0, "cash_5y_yield_pct": 3.1,
+               "cash_10y_yield_pct": 3.3, "3y_futures_yield_pct": 3.1,
+               "10y_futures_yield_pct": 3.45,
+               "cash_3y_time": "10:00:00", "cash_5y_time": "10:00:01",
+               "cash_10y_time": "10:00:02", "3y_trade_time": "10:00:00",
+               "10y_trade_time": "10:00:02"}
+        collector = datetime(2026, 10, 15, 1, 0, 3, tzinfo=timezone.utc)
+        self.assertTrue(metric_is_fresh(row, "cash_butterfly_bp", collector, ExtraSettings()))
+        self.assertTrue(metric_is_fresh(row, "cross_basis_bp", collector, ExtraSettings()))
+        stale = {**row, "cash_5y_time": "09:58:00"}
+        self.assertFalse(metric_is_fresh(stale, "cash_butterfly_bp", collector, ExtraSettings()))
+        self.assertNotIn("cash_butterfly_bp", market_metrics({**row, "cash_5y_yield_pct": 0}))
+
+    def test_relative_value_dashboard_is_optional_and_discloses_proxy_limits(self):
+        view = self._headless_dashboard([])
+        stamp = datetime.now(timezone.utc)
+        row = {**quote(), "timestamp_utc": stamp.isoformat(),
+               "cash_3y_yield_pct": 3.861, "cash_5y_yield_pct": 4.000,
+               "cash_10y_yield_pct": 4.188, "3y_futures_yield_pct": 3.934,
+               "10y_futures_yield_pct": 4.221}
+        self.assertTrue(view._configure_auto_dv01(row))
+        view._update_relative_value(row, stamp)
+        curve, basis, execution = view._relative_value_texts(row, stamp)
+        self.assertIn("현물 5Y 곡률", curve)
+        self.assertIn("원천시각 미연결", curve)
+        self.assertIn("교차 베이시스 -4.00bp", basis)
+        self.assertIn("계약월 미연결", basis)
+        self.assertIn("왕복 호가비용", execution)
 
     def test_alert_confirmation_hysteresis_and_stale_block(self):
         rule = AlertRule("test", "futures_spread", "above", 3.0,
@@ -796,6 +855,9 @@ class SafetyTests(unittest.TestCase):
         self.assertAlmostEqual(row["10y_best_bid"], 100)
         self.assertIn("futures_yield_spread_bp", row)
         self.assertEqual(row["futures_yield_spread_bp"], "")
+        self.assertNotIn("basis_3y_bp", row)
+        self.assertNotIn("basis_10y_bp", row)
+        self.assertNotIn("cross_basis_bp", row)
         reader._extra_snapshot = MagicMock(return_value={"3y_futures_yield_pct": 3.5,
                                                          "10y_futures_yield_pct": 3.8})
         with_yields = reader.snapshot()
@@ -865,6 +927,36 @@ class SafetyTests(unittest.TestCase):
             logger.close()
             with logger.csv_path.open(newline="", encoding="utf-8-sig") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 3)
+
+    def test_collector_accepts_optional_five_year_cash_binding(self):
+        settings = parse_settings({"bindings": {
+            "cash_5y_yield_pct": {"sheet": "추가RTD", "cell": "B11"},
+            "cash_5y_time": {"sheet": "추가RTD", "cell": "B12"}}})
+        base, extra = MagicMock(), MagicMock()
+        base.book.sheets.__getitem__.return_value = extra
+        extra.range.return_value.options.return_value.value = [[4.0], ["10:01:02"]]
+        reader = ExcelRtdReader("unused", "Sheet1", settings)
+        reader._sheet = base
+        result = reader._extra_snapshot()
+        extra.range.assert_called_once_with("B11:B12")
+        self.assertEqual(result, {"cash_5y_yield_pct": 4.0, "cash_5y_time": "10:01:02"})
+
+    def test_relative_tracker_does_not_reuse_pre_gap_half_life_segment(self):
+        tracker = RelativeValueTracker(window_minutes=60, min_samples=2)
+        start = datetime(2026, 10, 21, 0, 0, tzinfo=timezone.utc)
+        for minute in range(12):
+            tracker.update({"timestamp_utc": (start + timedelta(minutes=minute)).isoformat(),
+                            "cash_3y_yield_pct": 3.0,
+                            "cash_10y_yield_pct": 3.2,
+                            "3y_futures_yield_pct": 3.1,
+                            "10y_futures_yield_pct": 3.3 + 0.8 ** minute})
+        self.assertIsNotNone(tracker.summary()["half_life_minutes"])
+        after_gap = tracker.update({
+            "timestamp_utc": (start + timedelta(minutes=20)).isoformat(),
+            "cash_3y_yield_pct": 3.0, "cash_10y_yield_pct": 3.2,
+            "3y_futures_yield_pct": 3.1, "10y_futures_yield_pct": 3.35})
+        self.assertEqual(after_gap["continuous_samples"], 0)
+        self.assertIsNone(after_gap["half_life_minutes"])
 
     def _replay_fixture(self, folder, rows, signals):
         path, settings = Path(folder) / "input.csv", Path(folder) / "settings.json"

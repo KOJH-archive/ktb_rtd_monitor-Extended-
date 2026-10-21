@@ -173,7 +173,13 @@ class ExcelRtdReader:
             # are temporarily blank. A later valid value must not stop logging.
             row.update({"futures_spread": "", "cash_spread_bp": "",
                         "futures_yield_spread_bp": ""})
-            row.update(market_metrics(row))
+            # Persist the established derived schema only. New relative-value
+            # metrics are deterministically recomputed from raw yields by the UI,
+            # avoiding an in-day CSV header change after a software update.
+            calculated = market_metrics(row)
+            for key in ("futures_spread", "cash_spread_bp", "futures_yield_spread_bp"):
+                if key in calculated:
+                    row[key] = calculated[key]
             return row
         except Exception as exc:
             self._sheet = None
@@ -205,9 +211,10 @@ class ExcelRtdReader:
             if binding is not None:
                 groups.setdefault(binding.sheet, []).append((key, binding))
         result: dict[str, object] = {}
-        numeric = {"cash_3y_yield_pct", "cash_10y_yield_pct", "3y_foreign_buy", "3y_foreign_sell",
+        numeric = {"cash_3y_yield_pct", "cash_5y_yield_pct", "cash_10y_yield_pct",
+                   "3y_foreign_buy", "3y_foreign_sell",
                    "10y_foreign_buy", "10y_foreign_sell", "3y_futures_yield_pct", "10y_futures_yield_pct"}
-        yields = {"cash_3y_yield_pct", "cash_10y_yield_pct",
+        yields = {"cash_3y_yield_pct", "cash_5y_yield_pct", "cash_10y_yield_pct",
                   "3y_futures_yield_pct", "10y_futures_yield_pct"}
         for sheet_name, bindings in groups.items():
             sheet = self._sheet if sheet_name == self.sheet_name else self._sheet.book.sheets[sheet_name]

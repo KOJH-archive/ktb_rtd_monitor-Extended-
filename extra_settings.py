@@ -8,15 +8,20 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 FEED_FIELDS = (
-    "cash_3y_yield_pct", "cash_10y_yield_pct", "cash_3y_time", "cash_10y_time",
+    "cash_3y_yield_pct", "cash_5y_yield_pct", "cash_10y_yield_pct",
+    "cash_3y_time", "cash_5y_time", "cash_10y_time",
     "3y_foreign_buy", "3y_foreign_sell", "10y_foreign_buy", "10y_foreign_sell",
     "3y_futures_yield_pct", "10y_futures_yield_pct", "3y_trade_time", "10y_trade_time",
     "3y_foreign_time", "10y_foreign_time", "session_id", "3y_contract", "10y_contract",
-    "cash_3y_bond", "cash_10y_bond",
+    "cash_3y_bond", "cash_5y_bond", "cash_10y_bond",
 )
 METRICS = {"futures_spread": "10년−3년 선물 체결가차 (pt)",
            "futures_yield_spread_bp": "10년−3년 선물 수익률 차 (bp)",
            "cash_spread_bp": "현물 10년−3년 체결수익률차 (bp)",
+           "cash_butterfly_bp": "현물 3−5−10년 곡률 (bp)",
+           "basis_3y_bp": "3년 현선물 수익률 베이시스 (bp)",
+           "basis_10y_bp": "10년 현선물 수익률 베이시스 (bp)",
+           "cross_basis_bp": "10년−3년 교차 베이시스 (bp)",
            "3y_trade_price": "3년 선물 체결가", "10y_trade_price": "10년 선물 체결가"}
 
 
