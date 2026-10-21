@@ -21,6 +21,8 @@ from ktb_rtd_monitor import (ExcelConnectionUnavailable, ExcelRtdReader, FeedUna
                              PollSchedule, SnapshotLogger, _numbers)
 from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
                                market_metrics, metric_is_fresh, source_timestamp)
+from monitor_launcher import (AlreadyRunning, DATA_DIR, PYTHON, InstanceLock,
+                              _stop, collector_command)
 from paper_backtest import replay
 from signal_engine import SignalEngine, SignalResult, validated_row
 
@@ -39,6 +41,25 @@ def quote(seconds=0, mid10=100.0):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_one_click_launcher_command_lock_and_shutdown(self):
+        command = collector_command()
+        self.assertEqual(command[0], str(PYTHON))
+        self.assertEqual(command[command.index("--interval-ms") + 1], "1000")
+        self.assertEqual(command[command.index("--output-dir") + 1], str(DATA_DIR))
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            lock_path = Path(folder) / "launcher.lock"
+            with InstanceLock(lock_path):
+                with self.assertRaises(AlreadyRunning):
+                    with InstanceLock(lock_path):
+                        pass
+            with InstanceLock(lock_path):
+                pass
+        process = MagicMock()
+        process.poll.return_value = None
+        _stop(process)
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5.0)
+
     def test_excel_connection_backoff_and_quote_error_cadence(self):
         cadence = PollSchedule(1000)
         self.assertEqual(cadence.normal_seconds, 1)

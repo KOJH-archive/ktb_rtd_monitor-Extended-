@@ -20,7 +20,7 @@ CheckExpert RTD가 갱신하는 기존 Excel을 읽어 3년·10년 국채선물 
 | 저장 | csv, SQLite(sqlite3), WAL, synchronous=NORMAL | 로컬 파일, CSV/UI와 SQLite/보관 이중 출력. 분산 DB 없음 |
 | UI | Tkinter, 500ms after callback | 로컬 데스크톱 화면, 웹서버·다중 사용자 기능 없음 |
 | 품질 검증 | unittest, unittest.mock, hashlib | 실제 데이터 재생, 품질 감사, 입력/코드 SHA-256 |
-| 기동 | Windows BAT, argparse CLI | 일상 실행 BAT는 수집기·UI 2개. 요약·재생은 필요 시 Python CLI로 실행 |
+| 기동 | Windows BAT, Python supervisor, argparse CLI | `KTB_모니터_시작.bat` 한 번으로 수집기와 UI를 함께 시작·종료. 요약·재생은 필요 시 Python CLI로 실행 |
 
 ## 3. 모듈과 데이터 흐름
 
@@ -50,6 +50,7 @@ settings.json → 공통 설정 검증 → UI/신호/재생
 | `decision_support.py` | 호가잔량 압력, 수동 적정가 비교, 가상 패키지 위험, 비용필터, 가상 bid/ask 손익 |
 | `app_settings.py` | frozen dataclasses, 설정 로드/검증, DV01 패키지 및 beta |
 | `dashboard.py` | bounded CSV tail, 지표 표시, 데이터 지연·오류 시 사용 금지 표시 |
+| `monitor_launcher.py` | 단일 실행 잠금, 숨김 수집기 시작, 대시보드 수명주기 감독, 함께 종료 |
 | `paper_backtest.py` | 가상 pending/position 상태, 다음 관측 체결, 비용 분리·미청산 표시 |
 | `audit_snapshots.py` | 입력 정합성·공백·이벤트 시간폭 집계, 해시 기록 |
 | `test_metrics.py`, `test_safety.py` | 기존 수학 회귀시험 + 안전성/체결타이밍/저장 검증 |
@@ -224,4 +225,6 @@ UI는 데이터 지연/미래 시각이면 현재 신호 사용 금지를 표시
 .\.venv32\Scripts\python.exe paper_backtest.py data/snapshots_with_trades.csv --settings settings.json --output data/replay_new.csv
 ```
 
-실시간 실행은 Excel 연결을 사용자가 먼저 확인하고 `실시간_호가_시작.bat`, `대시보드_시작.bat` 순서로 실행한다. 테스트는 모의 Excel 객체를 사용하며 실시간 데이터 연결 성공을 뜻하지 않는다. 상세 검증 결과와 미완료 항목은 [FINAL_REVIEW.md](FINAL_REVIEW.md), 업무 적용 경계는 [TRADING_SCOPE.md](TRADING_SCOPE.md)를 따른다.
+실시간 실행은 Excel 연결을 사용자가 먼저 확인하고 `KTB_모니터_시작.bat`을 한 번 실행한다. BAT는 `pythonw.exe`로 `monitor_launcher.py`를 시작하므로 별도 콘솔을 유지하지 않는다. 실행기는 `data/monitor_launcher.lock`에 비차단 Windows 파일 잠금을 잡아 같은 폴더의 중복 통합 실행을 막는다. 수집기는 콘솔 없이 자식 프로세스로 실행되고 stdout/stderr는 `data/launcher.log`에 기록된다. 1초 뒤 수집기가 살아 있으면 대시보드를 시작한다. 대시보드가 종료되면 수집기를 정상 종료 요청하고 5초 안에 끝나지 않을 때만 강제 종료한다. 잠금은 프로세스가 종료되면 운영체제가 해제하므로 잠금 파일이 남아 있어도 실행 상태를 뜻하지 않는다. 개발자가 수집기를 CLI로 별도 실행하는 경우까지 중복 방지하는 잠금은 아니다.
+
+테스트는 모의 Excel 객체를 사용하며 실시간 데이터 연결 성공을 뜻하지 않는다. 상세 검증 결과와 미완료 항목은 [FINAL_REVIEW.md](FINAL_REVIEW.md), 업무 적용 경계는 [TRADING_SCOPE.md](TRADING_SCOPE.md)를 따른다.
