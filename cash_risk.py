@@ -77,6 +77,14 @@ def _forecast(values: list[float]) -> float | None:
 
 
 def target_packages(points: list[CashDay], risk: RiskSettings, as_of: date) -> dict[str, object]:
+    past = [point for point in points if point.day <= as_of]
+    if not past:
+        return {"status": "insufficient_history", "observations": 0,
+                "required": LONG_WINDOW, "as_of": as_of.isoformat()}
+    history_age_days = (as_of - past[-1].day).days
+    history = {"history_as_of": past[-1].day.isoformat(),
+               "history_age_days": history_age_days,
+               "history_stale": history_age_days > risk.cash_history_max_age_days}
     required = {"risk.dv01_3y_krw_per_bp": risk.dv01_3y_krw_per_bp,
                 "risk.dv01_10y_krw_per_bp": risk.dv01_10y_krw_per_bp,
                 "risk.capital_krw": risk.capital_krw,
@@ -84,14 +92,16 @@ def target_packages(points: list[CashDay], risk: RiskSettings, as_of: date) -> d
                 "risk.max_package_count": risk.max_package_count}
     missing = [name for name, value in required.items() if value is None]
     if missing:
-        return {"status": "missing_settings", "missing": missing}
-    past = [point for point in points if point.day <= as_of]
+        return {"status": "missing_settings", "missing": missing, **history}
+    if history["history_stale"]:
+        return {"status": "stale_history", "max_age_days": risk.cash_history_max_age_days,
+                **history}
     changes = _changes(past, risk)
     values = [float(item["package_proxy_pnl_krw"]) for item in changes]
     forecast = _forecast(values)
     if forecast is None:
         return {"status": "insufficient_history", "observations": len(values),
-                "required": LONG_WINDOW, "as_of": as_of.isoformat()}
+                "required": LONG_WINDOW, "as_of": as_of.isoformat(), **history}
     if forecast <= 0:
         return {"status": "zero_observed_volatility", "as_of": past[-1].day.isoformat()}
     package = dv01_package(risk)
@@ -106,7 +116,7 @@ def target_packages(points: list[CashDay], risk: RiskSettings, as_of: date) -> d
         count = min(count, math.floor(risk.max_gross_dv01_krw_per_bp / gross_per))
     if risk.max_residual_dv01_krw_per_bp is not None and residual_per > 0:
         count = min(count, math.floor(risk.max_residual_dv01_krw_per_bp / residual_per))
-    return {"status": "research_proxy", "as_of": past[-1].day.isoformat(),
+    return {"status": "research_proxy", "as_of": past[-1].day.isoformat(), **history,
             "observations": len(values), "daily_budget_krw": daily_budget,
             "unit_daily_sigma_krw": forecast,
             "target_packages": count, "contracts_3y": count * int(package["rounded_3y"]),

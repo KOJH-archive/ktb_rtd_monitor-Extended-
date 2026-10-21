@@ -174,6 +174,20 @@ class Dashboard(tk.Tk):
         self.curve_tracker = CashCurveTracker()
         self.flow_history: ForeignHistoryReplay | None = None
         self.flow_catchup_end: int | None = None
+        self.risk_window_started_at: datetime | None = None
+        self.risk_reset_reason: str | None = None
+
+    def _record_risk_progress(self, result, row: dict[str, object]) -> None:
+        timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        if self.risk_window_started_at is None:
+            self.risk_window_started_at = timestamp
+            if self.risk_reset_reason is None:
+                self.risk_reset_reason = "startup"
+        if result.reset_reason:
+            self.risk_window_started_at = timestamp
+            self.risk_reset_reason = result.reset_reason
 
     def _ingest_foreign_row(self, row: dict[str, object], timestamp: datetime) -> None:
         session = row.get("session_id") or timestamp_kst(timestamp).date()
@@ -198,11 +212,22 @@ class Dashboard(tk.Tk):
                 timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
                 if timestamp_kst(timestamp).date() != today or timestamp > datetime.now(timezone.utc):
                     raise ValueError("Outside current trading day")
+                result = self.engine.update(row)
+                self.fast_result, self.core_result = result.fast, result.core
+                self._record_risk_progress(result, row)
                 self._ingest_foreign_row(row, timestamp)
             except (KeyError, ValueError, TypeError, OverflowError):
+                self.engine.reset()
+                self.fast_result = self.core_result = None
+                self.risk_window_started_at = None
+                self.risk_reset_reason = "invalid_row"
                 for tracker in self.foreign_trackers.values():
                     tracker.pause()
         if history.done:
+            # Historical observations warm only the volatility/RV windows. A
+            # historical consensus state is never carried into live decisions.
+            self.engine.consensus.reset()
+            self.decision_text = "복원 완료 · 새 관측부터 판단"
             self.flow_history = None
             self.flow_catchup_end = history.path.stat().st_size
 
@@ -306,7 +331,12 @@ class Dashboard(tk.Tk):
         if status == "missing_history":
             return "일별 현물금리 CSV 미연결 · settings.json의 risk.cash_history_csv 입력 필요"
         if status == "missing_settings":
-            return "위험예산·DV01 입력 필요 · " + ", ".join(report["missing"])
+            stale = (f"\n현물금리 {report['history_as_of']} 기준 · {report['history_age_days']}일 경과 · 갱신 필요"
+                     if report.get("history_stale") else "")
+            return "위험예산·DV01 입력 필요 · " + ", ".join(report["missing"]) + stale
+        if status == "stale_history":
+            return (f"수량 차단 · 현물금리 자료가 {report['history_as_of']} 기준으로 "
+                    f"{report['history_age_days']}일 경과 (허용 {report['max_age_days']}일)")
         if status == "insufficient_history":
             return f"일별 위험 표본 {report['observations']}/{report['required']}개 · 수량 준비 중"
         if status != "research_proxy":
@@ -442,10 +472,24 @@ class Dashboard(tk.Tk):
             self.volatility.config(text=f"1분 변화 σ  {value:.5f} pt\n{samples}개 변화 표본 · 연율 환산 없음",
                                    fg=ACCENT if fresh else MUTED)
         else:
-            self.volatility.config(text=f"준비 중 · 1분 변화 {samples}개\n완료 {self.settings.rv.core_minutes}분 필요", fg=MUTED)
+            required_changes = max(1, self.settings.rv.core_minutes - 1)
+            self.volatility.config(text=f"준비 중 · 연속 1분 변화 {samples}/{required_changes}개\n"
+                                   f"완료 분 {int(core.get('samples', 0))}/{self.settings.rv.core_minutes}개",
+                                   fg=MUTED)
         span = float((self.fast_result or {}).get("span_seconds", 0))
-        self.window_note.config(text=f"빠른 {self.settings.rv.fast_event_window}이벤트의 실제 길이: {span / 60:.1f}분\n"
-                                f"주 {self.settings.rv.core_minutes}분은 장중 기준 · 수일/수주 기준 및 변동성 타겟팅 미구현")
+        fast_samples = int((self.fast_result or {}).get("samples", 0))
+        core_samples = int(core.get("samples", 0))
+        start = (timestamp_kst(self.risk_window_started_at).strftime("%H:%M:%S")
+                 if self.risk_window_started_at else "대기")
+        reason = {"data_gap": "데이터 공백 후", "calendar_day_change": "날짜 변경 후",
+                  "invalid_row": "불량 데이터 후", "startup": "당일 기록 복원/시작"}.get(
+                      self.risk_reset_reason, "현재")
+        self.window_note.config(
+            text=f"연속 구간 {start} KST · {reason} 재준비\n"
+                 f"빠른 {fast_samples}/{self.settings.rv.fast_event_window} 이벤트 "
+                 f"({max(0, self.settings.rv.fast_event_window-fast_samples)}개 남음, 실제 {span/60:.1f}분) · "
+                 f"주 {core_samples}/{self.settings.rv.core_minutes}분 "
+                 f"({max(0, self.settings.rv.core_minutes-core_samples)}분 남음)")
 
     def _decision_text(self) -> str:
         rv = self.settings.rv
@@ -474,7 +518,7 @@ class Dashboard(tk.Tk):
             if self.flow_history is not None:
                 self._restore_foreign_history()
                 if self.flow_history is not None:
-                    self.status.config(text=f"오늘 외국인 수급 복원 중 · {self.flow_history.rows_read:,}행", fg=MUTED)
+                    self.status.config(text=f"오늘 수급·변동성 복원 중 · {self.flow_history.rows_read:,}행", fg=MUTED)
                     self.after(25, self.refresh)
                     return
             if not self.pending_rows:
@@ -511,6 +555,7 @@ class Dashboard(tk.Tk):
                 self.signal_result = result
                 self.latest_row = row
                 self.fast_result, self.core_result = result.fast, result.core
+                self._record_risk_progress(result, row)
                 self.flow_result = self.flow_analyzer.update(row)
                 self.decision_text = result.text
                 timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))

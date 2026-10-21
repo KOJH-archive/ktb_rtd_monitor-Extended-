@@ -10,7 +10,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from types import MethodType, SimpleNamespace
 
-from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer
+import monitor_launcher
+from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer, timestamp_kst
 from cash_risk import CashDay, _changes, load_cash_days, oos_check, target_packages
 from curve_context import CashCurveTracker
 from app_settings import AppSettings, DataSettings, RVSettings, RiskSettings, load_settings
@@ -60,6 +61,16 @@ class SafetyTests(unittest.TestCase):
         process.terminate.assert_called_once()
         process.wait.assert_called_once_with(timeout=5.0)
 
+    def test_launcher_rotates_oversized_log(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            log_path = Path(folder) / "launcher.log"
+            log_path.write_bytes(b"old log")
+            with (patch.object(monitor_launcher, "LOG_PATH", log_path),
+                  patch.object(monitor_launcher, "MAX_LOG_BYTES", 4)):
+                monitor_launcher._rotate_log()
+            self.assertFalse(log_path.exists())
+            self.assertEqual(log_path.with_suffix(".log.old").read_bytes(), b"old log")
+
     def test_excel_connection_backoff_and_quote_error_cadence(self):
         cadence = PollSchedule(1000)
         self.assertEqual(cadence.normal_seconds, 1)
@@ -105,6 +116,7 @@ class SafetyTests(unittest.TestCase):
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
                                                                "futures_yield_spread_bp", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_ingest_foreign_row", "_restore_foreign_history",
+                       "_record_risk_progress",
                        "_decision_text", "_flow_text", "_basis_text", "_cost_text",
                        "_market_text", "_foreign_text", "_curve_text", "_sizing_text", "_render_overview",
                        "_clear_market_display", "refresh"):
@@ -399,6 +411,8 @@ class SafetyTests(unittest.TestCase):
                 while view.flow_history is not None:
                     view.refresh()
                 self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 40)
+                self.assertIsNotNone(view.fast_result)
+                self.assertEqual(view.risk_reset_reason, "data_gap")
                 view.alert_engine.update.assert_not_called()
                 self.assertIsNotNone(view.latest_row)
                 with path.open("a", newline="", encoding="utf-8") as handle:
@@ -409,6 +423,34 @@ class SafetyTests(unittest.TestCase):
                 self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 50)
                 self.assertIsNotNone(view.latest_row)
                 view.alert_engine.update.assert_called_once()
+
+    def test_startup_history_warms_risk_without_replaying_other_tabs(self):
+        start = datetime.now(timezone.utc) - timedelta(minutes=3)
+        if timestamp_kst(start).date() != timestamp_kst(datetime.now(timezone.utc)).date():
+            self.skipTest("KST day boundary")
+        rows = [{**quote(step * 5, 100 + step / 1000),
+                 "timestamp_utc": (start + timedelta(seconds=step * 5)).isoformat()}
+                for step in range(30)]
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            path = Path(folder) / "today.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            view = self._headless_dashboard([])
+            view.tail = IncrementalCsvTail()
+            with patch("dashboard.current_csv", return_value=path):
+                view.refresh()  # Attach at EOF and schedule startup restoration.
+                view.flow_analyzer.update = MagicMock()
+                view.curve_tracker.update = MagicMock()
+                view.alert_engine.update = MagicMock(return_value=[])
+                while view.flow_history is not None:
+                    view.refresh()
+            self.assertEqual(view.fast_result["samples"], 30)
+            self.assertGreaterEqual(view.core_result["samples"], 2)
+            view.flow_analyzer.update.assert_not_called()
+            view.curve_tracker.update.assert_not_called()
+            view.alert_engine.update.assert_not_called()
 
     def test_foreign_rolling_windows_exclude_old_flow_and_flag_partial_history(self):
         tracker = ForeignFlowTracker("3y", ExtraSettings())
@@ -484,6 +526,19 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(target_packages(points + [future], risk, points[-1].day), baseline)
         self.assertEqual(target_packages(points, replace(risk, capital_krw=None), points[-1].day)
                          ["status"], "missing_settings")
+        stale = target_packages(points, risk, points[-1].day + timedelta(days=5))
+        self.assertEqual(stale["status"], "stale_history")
+        self.assertEqual(stale["history_age_days"], 5)
+
+    def test_missing_risk_settings_still_reports_stale_cash_history(self):
+        from datetime import date
+        points = [CashDay(date(2026, 10, 15), 300.0, 330.0)]
+        report = target_packages(points, RiskSettings(), date(2026, 10, 20))
+        self.assertEqual(report["status"], "missing_settings")
+        self.assertTrue(report["history_stale"])
+        view = self._headless_dashboard([])
+        view.cash_risk_report = report
+        self.assertIn("갱신 필요", view._sizing_text())
 
     def test_cash_curve_oos_is_chronological_and_requires_long_history(self):
         from datetime import date

@@ -28,6 +28,7 @@ class RiskSettings:
     annual_target_vol_fraction: float | None = None
     max_package_count: int | None = None
     cash_history_csv: str | None = None
+    cash_history_max_age_days: int = 4
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,9 @@ def load_settings(path: Path) -> AppSettings:
         max_package_count=(None if risk_raw.get("max_package_count") is None else
                            _integer(risk_raw["max_package_count"], "risk.max_package_count", minimum=1)),
         cash_history_csv=risk_raw.get("cash_history_csv"),
+        cash_history_max_age_days=_integer(
+            risk_raw.get("cash_history_max_age_days", defaults.risk.cash_history_max_age_days),
+            "risk.cash_history_max_age_days", minimum=1),
     )
     if (risk.dv01_3y_krw_per_bp is None) != (risk.dv01_10y_krw_per_bp is None):
         raise ValueError("Both 3Y and 10Y DV01 values must be supplied together")

@@ -15,6 +15,7 @@ WORKBOOK = ROOT / "국채선물 호가창.xlsx"
 DATA_DIR = ROOT / "data"
 LOG_PATH = DATA_DIR / "launcher.log"
 LOCK_PATH = DATA_DIR / "monitor_launcher.lock"
+MAX_LOG_BYTES = 2 * 1024 * 1024
 
 
 class AlreadyRunning(RuntimeError):
@@ -64,6 +65,15 @@ def collector_command() -> list[str]:
             "--heartbeat-seconds", "5", "--quiet"]
 
 
+def _rotate_log() -> None:
+    """Keep the launcher log small without touching market-data files."""
+    if not LOG_PATH.is_file() or LOG_PATH.stat().st_size < MAX_LOG_BYTES:
+        return
+    backup = LOG_PATH.with_suffix(".log.old")
+    backup.unlink(missing_ok=True)
+    LOG_PATH.replace(backup)
+
+
 def _stop(process: subprocess.Popen, timeout: float = 5.0) -> None:
     if process.poll() is not None:
         return
@@ -85,6 +95,7 @@ def main() -> int:
     try:
         with InstanceLock(LOCK_PATH):
             DATA_DIR.mkdir(parents=True, exist_ok=True)
+            _rotate_log()
             with LOG_PATH.open("a", encoding="utf-8") as log:
                 log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] one-click launcher started\n")
                 log.flush()
