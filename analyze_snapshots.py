@@ -36,6 +36,11 @@ class RollingRVAnalyzer:
         self.event_times.clear()
         self._cached = None
 
+    def pause(self) -> None:
+        """Keep same-day observations but never create a change across a gap."""
+        self.previous = None
+        self.event_changed = False
+
     def update(self, row: dict[str, object]) -> dict[str, object] | None:
         self.event_changed = False
         mid3 = row.get("3y_mid", row.get("3y_trade_price"))
@@ -107,11 +112,12 @@ class MinuteRVAnalyzer:
         self.minutes = minutes
         self.beta = beta
         self.min_samples = minutes if min_samples is None else min_samples
-        self.points: deque[tuple[datetime, float]] = deque()
+        self.points: deque[tuple[datetime, float, int]] = deque()
         self.session_date = None
         self.timestamp: object = ""
         self.event_changed = False
-        self.current: tuple[datetime, float] | None = None
+        self.current: tuple[datetime, float, int] | None = None
+        self.segment = 0
         self._completed_stats: dict[str, object] | None = None
 
     def reset(self) -> None:
@@ -120,6 +126,19 @@ class MinuteRVAnalyzer:
         self.timestamp = ""
         self.event_changed = False
         self.current = None
+        self.segment = 0
+        self._completed_stats = None
+
+    def pause(self, next_timestamp: object | None = None) -> None:
+        """Keep completed history while marking the next minute as a new segment."""
+        self.event_changed = False
+        if next_timestamp is not None and self.current is not None:
+            next_bucket = timestamp_kst(next_timestamp).replace(second=0, microsecond=0)
+            if next_bucket <= self.current[0]:
+                return
+            self.points.append(self.current)
+        self.current = None
+        self.segment += 1
         self._completed_stats = None
 
     def update(self, row: dict[str, object]) -> dict[str, object] | None:
@@ -142,8 +161,9 @@ class MinuteRVAnalyzer:
         if self.current and bucket > self.current[0]:
             self.points.append(self.current)
             self._completed_stats = None
-        self.event_changed = self.current != (bucket, level)
-        self.current = (bucket, level)
+        candidate = (bucket, level, self.segment)
+        self.event_changed = self.current != candidate
+        self.current = candidate
         cutoff = bucket - timedelta(minutes=self.minutes)
         while self.points and self.points[0][0] < cutoff:
             self.points.popleft()
@@ -156,11 +176,12 @@ class MinuteRVAnalyzer:
         latest = self.current[1]
         if self._completed_stats is None:
             points = list(self.points)
-            levels = [level for _, level in points]
+            levels = [level for _, level, _ in points]
             # Fixed-time changes, including unchanged minute closes. Never
             # confuse level dispersion or an event-time change with P&L risk.
             changes = [right[1] - left[1] for left, right in zip(points, points[1:])
-                       if right[0] - left[0] == timedelta(minutes=1)]
+                       if right[2] == left[2]
+                       and right[0] - left[0] == timedelta(minutes=1)]
             self._completed_stats = {
                 "samples": len(levels),
                 "level_mean": statistics.fmean(levels) if levels else None,

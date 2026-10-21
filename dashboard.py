@@ -2,7 +2,7 @@ from __future__ import annotations
 import csv, json, math, os, tkinter as tk
 from collections import deque
 from time import perf_counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer, timestamp_kst
@@ -14,6 +14,7 @@ from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
 from signal_engine import SignalEngine, validated_row
 from curve_context import CashCurveTracker
 from cash_risk import load_cash_days, target_packages
+from futures_dv01 import futures_dv01_pair
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -137,10 +138,32 @@ def numeric_row(row: dict[str, str]) -> dict[str, object]:
             parsed[key] = value
     return parsed
 
+
+def recent_complete_rows(path: Path, limit: int, header: list[str],
+                         maximum_bytes: int = 1024 * 1024):
+    """Yield recent complete CSV rows newest-first without changing tail state."""
+    start = max(0, limit - maximum_bytes)
+    with path.open("rb") as handle:
+        handle.seek(start)
+        data = handle.read(limit - start)
+    if start:
+        _, separator, data = data.partition(b"\n")
+        if not separator:
+            return
+    lines = data.splitlines(keepends=True)
+    if lines and not lines[-1].endswith(b"\n"):
+        lines.pop()
+    for raw in reversed(lines):
+        values = next(csv.reader([raw.rstrip(b"\r\n").decode("utf-8-sig")]))
+        if values != header and len(values) == len(header):
+            yield dict(zip(header, values))
+
 class Dashboard(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.settings: AppSettings = load_settings(SETTINGS_PATH)
+        self.base_settings: AppSettings = load_settings(SETTINGS_PATH)
+        self.settings: AppSettings = self.base_settings
+        self.auto_dv01: dict[str, float | str] | None = None
         self.extra_settings = load_extra_settings(EXTRA_SETTINGS_PATH)
         self.tail = IncrementalCsvTail()
         self.fast_analyzer: RollingRVAnalyzer
@@ -185,9 +208,41 @@ class Dashboard(tk.Tk):
             self.risk_window_started_at = timestamp
             if self.risk_reset_reason is None:
                 self.risk_reset_reason = "startup"
-        if result.reset_reason:
+        if result.reset_reason and result.reset_reason != "data_gap_resumed":
             self.risk_window_started_at = timestamp
             self.risk_reset_reason = result.reset_reason
+        elif result.reset_reason == "data_gap_resumed":
+            self.risk_reset_reason = result.reset_reason
+
+    def _configure_auto_dv01(self, row: dict[str, object]) -> bool:
+        """Freeze standard-bond DV01 at launch; manual configured values win."""
+        base_risk = self.base_settings.risk
+        if base_risk.dv01_3y_krw_per_bp is not None or self.auto_dv01 is not None:
+            return False
+        try:
+            calculated = futures_dv01_pair(row)
+            timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
+            if timestamp.tzinfo is None:
+                return False
+            age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+            if not 0 <= age <= self.base_settings.data.stale_seconds:
+                return False
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        risk = replace(base_risk,
+                       dv01_3y_krw_per_bp=calculated["dv01_3y_krw_per_bp"],
+                       dv01_10y_krw_per_bp=calculated["dv01_10y_krw_per_bp"])
+        self.settings = replace(self.base_settings, risk=risk)
+        self.auto_dv01 = {**calculated, "timestamp_utc": timestamp.isoformat()}
+        self.engine = SignalEngine(self.settings)
+        self.fast_analyzer = self.engine.fast
+        self.core_analyzer = self.engine.core
+        self.consensus = self.engine.consensus
+        self.fast_result = self.core_result = self.signal_result = None
+        self.risk_window_started_at = None
+        self.risk_reset_reason = None
+        self.cash_risk_report = self._load_cash_risk()
+        return True
 
     def _ingest_foreign_row(self, row: dict[str, object], timestamp: datetime) -> None:
         session = row.get("session_id") or timestamp_kst(timestamp).date()
@@ -212,14 +267,20 @@ class Dashboard(tk.Tk):
                 timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
                 if timestamp_kst(timestamp).date() != today or timestamp > datetime.now(timezone.utc):
                     raise ValueError("Outside current trading day")
-                result = self.engine.update(row)
+                result = self.engine.update(row, preserve_history_on_gap=True)
                 self.fast_result, self.core_result = result.fast, result.core
                 self._record_risk_progress(result, row)
                 self._ingest_foreign_row(row, timestamp)
             except (KeyError, ValueError, TypeError, OverflowError):
-                self.engine.reset()
+                # A malformed historical row breaks continuity but should not
+                # erase valid same-day observations recovered before it.
+                self.engine.fast.pause()
+                self.engine.core.pause()
+                self.engine.consensus.reset()
+                self.engine.previous = None
                 self.fast_result = self.core_result = None
-                self.risk_window_started_at = None
+                self.fast_result = self.engine.fast.result()
+                self.core_result = self.engine.core.result()
                 self.risk_reset_reason = "invalid_row"
                 for tracker in self.foreign_trackers.values():
                     tracker.pause()
@@ -306,7 +367,14 @@ class Dashboard(tk.Tk):
         if metrics is None:
             return (f"DV01: 미설정 | 연구 beta {self.settings.rv.beta:.4f} 사용 | "
                     "계약별 DV01(원/bp)을 입력하면 헤지 비율을 계산합니다.")
-        return (f"DV01 헤지: 10Y {metrics['contracts_10y']}계약당 3Y {metrics['exact_3y']:.2f}계약 "
+        source = ""
+        if self.auto_dv01:
+            stamp = timestamp_kst(self.auto_dv01["timestamp_utc"])
+            source = (f"자동 표준채권 DV01 · 3Y {self.auto_dv01['dv01_3y_krw_per_bp']:,.0f} / "
+                      f"10Y {self.auto_dv01['dv01_10y_krw_per_bp']:,.0f}원/bp "
+                      f"· 수익률 {self.auto_dv01['yield_3y_pct']:.3f}%/{self.auto_dv01['yield_10y_pct']:.3f}% "
+                      f"· {stamp:%H:%M:%S} KST 수집값으로 실행 중 고정\n")
+        return (source + f"DV01 헤지: 10Y {metrics['contracts_10y']}계약당 3Y {metrics['exact_3y']:.2f}계약 "
                 f"| 정수 패키지 {metrics['rounded_3y']}:{metrics['contracts_10y']} "
                 f"| 총 {metrics['gross_dv01']:,.0f}원/bp | 잔여 {metrics['residual_dv01']:,.0f}원/bp "
                 f"| {metrics['status']} | 분석 beta {effective_beta(self.settings):.4f}")
@@ -465,6 +533,7 @@ class Dashboard(tk.Tk):
                 f"{value:+.1f}" if key.endswith("_spread_bp") else f"{value:.3f}")
             label.config(text=rendered, fg=INK if fresh else MUTED)
         self.sizing.config(text=self._sizing_text())
+        self.risk.config(text=self._risk_text())
         core = self.core_result or {}
         samples = int(core.get("minute_change_samples", 0))
         if core.get("minute_change_ready"):
@@ -481,11 +550,12 @@ class Dashboard(tk.Tk):
         core_samples = int(core.get("samples", 0))
         start = (timestamp_kst(self.risk_window_started_at).strftime("%H:%M:%S")
                  if self.risk_window_started_at else "대기")
-        reason = {"data_gap": "데이터 공백 후", "calendar_day_change": "날짜 변경 후",
+        reason = {"data_gap": "실시간 데이터 공백 후", "data_gap_resumed": "재실행 공백 연결 제외·당일 이력 복원",
+                  "calendar_day_change": "날짜 변경 후",
                   "invalid_row": "불량 데이터 후", "startup": "당일 기록 복원/시작"}.get(
                       self.risk_reset_reason, "현재")
         self.window_note.config(
-            text=f"연속 구간 {start} KST · {reason} 재준비\n"
+            text=f"당일 관측 기준 {start} KST · {reason}\n"
                  f"빠른 {fast_samples}/{self.settings.rv.fast_event_window} 이벤트 "
                  f"({max(0, self.settings.rv.fast_event_window-fast_samples)}개 남음, 실제 {span/60:.1f}분) · "
                  f"주 {core_samples}/{self.settings.rv.core_minutes}분 "
@@ -525,9 +595,16 @@ class Dashboard(tk.Tk):
                 start_offset = self.tail.offset
                 rows, reset = self.tail.read_new(csv_path)
                 if reset:
+                    self.settings = self.base_settings
+                    self.auto_dv01 = None
                     self._reset_analyzers()
+                    self.cash_risk_report = self._load_cash_risk()
                     if csv_path.is_file():
-                        self.flow_history = ForeignHistoryReplay(csv_path, self.tail.offset)
+                        history = ForeignHistoryReplay(csv_path, self.tail.offset)
+                        for recent in recent_complete_rows(csv_path, self.tail.offset, history.header):
+                            if self._configure_auto_dv01(numeric_row(recent)):
+                                break
+                        self.flow_history = history
                 self.pending_rows.extend(rows)
                 self.replaying = reset or (self.flow_catchup_end is not None
                                            and start_offset < self.flow_catchup_end)
@@ -538,12 +615,13 @@ class Dashboard(tk.Tk):
                 raw = self.pending_rows.popleft()
                 processed += 1
                 try:
-                    row = numeric_row(raw)
+                    row = validated_row(numeric_row(raw))
                     # Validate display-only metrics as well as shared quotes.
                     for name in ("3y", "10y"):
                         for key in ("microprice", "obi", "weighted_obi", "bid_depth", "ask_depth"):
                             if not math.isfinite(float(row[f"{name}_{key}"])):
                                 raise ValueError("Non-finite display metric")
+                    self._configure_auto_dv01(row)
                     result = self.engine.update(row)
                 except (KeyError, ValueError, TypeError):
                     self.rejected_rows += 1

@@ -63,7 +63,7 @@ class SignalEngine:
         self.consensus.reset()
         self.previous = None
 
-    def update(self, raw: dict[str, object]) -> SignalResult:
+    def update(self, raw: dict[str, object], preserve_history_on_gap: bool = False) -> SignalResult:
         try:
             row = validated_row(raw)
             stamp = timestamp_kst(row["timestamp_utc"])
@@ -79,7 +79,16 @@ class SignalEngine:
             elif (stamp - self.previous).total_seconds() > self.settings.data.max_gap_seconds:
                 reason = "data_gap"
         if reason:
-            self.reset()
+            if preserve_history_on_gap and reason == "data_gap":
+                # A dashboard restart must not erase today's observations.  Break
+                # return/confirmation continuity so no move during the outage is
+                # treated as an observed one-period change or a confirmed signal.
+                self.fast.pause()
+                self.core.pause(row["timestamp_utc"])
+                self.consensus.reset()
+                reason = "data_gap_resumed"
+            else:
+                self.reset()
         self.previous = stamp
         fast, core = self.fast.update(row), self.core.update(row)
         ready = bool(fast and core and fast["samples"] >= self.settings.rv.fast_event_window

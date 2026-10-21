@@ -8,10 +8,31 @@ from app_settings import (AppSettings, BasisSettings, ExecutionSettings, FlowSet
                           dv01_package, effective_beta, load_settings)
 from decision_support import (OrderFlowAnalyzer, basis_metrics, executable_package_pnl,
                               execution_gate, risk_metrics)
+from futures_dv01 import (analytic_standard_bond_dv01, futures_dv01_pair,
+                          standard_bond_dv01, standard_bond_price)
 from dashboard import IncrementalCsvTail
 
 
 class MetricTests(unittest.TestCase):
+    def test_krx_standard_bond_dv01_matches_analytic_derivative(self):
+        for maturity, yield_pct in ((3, 3.913), (10, 4.194)):
+            with self.subTest(maturity=maturity):
+                numeric = standard_bond_dv01(yield_pct, maturity)
+                analytic = analytic_standard_bond_dv01(yield_pct, maturity)
+                self.assertGreater(numeric, 0)
+                self.assertAlmostEqual(numeric, analytic, delta=0.02)
+        self.assertAlmostEqual(standard_bond_price(5.0, 3), 100.0, places=10)
+        self.assertAlmostEqual(standard_bond_price(5.0, 10), 100.0, places=10)
+        pair = futures_dv01_pair({"3y_futures_yield_pct": 3.913,
+                                  "10y_futures_yield_pct": 4.194})
+        self.assertGreater(pair["dv01_10y_krw_per_bp"], pair["dv01_3y_krw_per_bp"])
+        self.assertAlmostEqual(pair["beta"], pair["dv01_10y_krw_per_bp"] /
+                               pair["dv01_3y_krw_per_bp"])
+        for bad in ({}, {"3y_futures_yield_pct": 0, "10y_futures_yield_pct": 4.0},
+                    {"3y_futures_yield_pct": True, "10y_futures_yield_pct": 4.0}):
+            with self.assertRaises(ValueError):
+                futures_dv01_pair(bad)
+
     def test_metrics_reverse_excel_ask_order(self):
         row = _metrics("x", [104.75, 104.74, 104.73, 104.72, 104.71], [99, 103, 163, 106, 87],
                        [104.80, 104.79, 104.78, 104.77, 104.76], [26, 17, 14, 10, 1])

@@ -282,6 +282,10 @@ class _RollingForeignWindow:
         self.sell += sell
         self.buy_price_value += buy * price
         self.sell_price_value += sell * price
+        self.advance(timestamp)
+
+    def advance(self, timestamp: datetime) -> None:
+        """Expire old observed flow without inventing volume during a feed gap."""
         cutoff = timestamp - timedelta(minutes=self.minutes)
         while self.buckets and self.buckets[0].timestamp < cutoff:
             old = self.buckets.popleft()
@@ -337,9 +341,8 @@ class ForeignFlowTracker:
         self.resets += 1
 
     def pause(self) -> None:
-        """Keep observed session zones, but never price a gap's unknown fills."""
+        """Keep observed zones/windows, but never price a gap's unknown fills."""
         self.previous = self.previous_time = self.started_time = None
-        self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
 
     def update(self, row: dict[str, object], timestamp: datetime, session) -> None:
         buy = optional_number(row.get(f"{self.contract}_foreign_buy"))
@@ -359,6 +362,8 @@ class ForeignFlowTracker:
                 or timestamp <= self.previous_time
                 or (timestamp - self.previous_time).total_seconds() > self.settings.flow_max_gap_seconds):
             self.pause()
+            for window in self.windows.values():
+                window.advance(timestamp)
             self.previous, self.previous_time, self.started_time, self.session = (buy, sell), timestamp, timestamp, session
             self.last_observed = (buy, sell)
             return

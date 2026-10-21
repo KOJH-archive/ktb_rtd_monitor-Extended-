@@ -110,13 +110,15 @@ class SafetyTests(unittest.TestCase):
                 editor.dashboard.reload_alerts.assert_called_once()
 
     def _headless_dashboard(self, rows):
-        view = SimpleNamespace(settings=AppSettings(), extra_settings=ExtraSettings(), rejected_rows=0,
+        base_settings = AppSettings()
+        view = SimpleNamespace(base_settings=base_settings, settings=base_settings, auto_dv01=None,
+                               extra_settings=ExtraSettings(), rejected_rows=0,
                                tail=MagicMock(), after=MagicMock(), winfo_id=MagicMock(return_value=1),
                                pending_rows=deque(), replaying=False, kpis={
                                    key: MagicMock() for key in ("3y_trade_price", "10y_trade_price",
                                                                "futures_yield_spread_bp", "cash_spread_bp")})
         for method in ("_reset_analyzers", "_ingest_foreign_row", "_restore_foreign_history",
-                       "_record_risk_progress",
+                       "_record_risk_progress", "_configure_auto_dv01", "_load_cash_risk", "_risk_text",
                        "_decision_text", "_flow_text", "_basis_text", "_cost_text",
                        "_market_text", "_foreign_text", "_curve_text", "_sizing_text", "_render_overview",
                        "_clear_market_display", "refresh"):
@@ -125,7 +127,7 @@ class SafetyTests(unittest.TestCase):
         view._reset_analyzers()
         for name in ("status", "decision", "fast_rv", "core_rv", "flow", "basis", "cost",
                      "market_spreads", "foreign_3y", "foreign_10y", "alert_status", "volatility",
-                     "window_note", "curve_position", "curve_trend", "sizing"):
+                     "window_note", "curve_position", "curve_trend", "sizing", "risk"):
             setattr(view, name, MagicMock())
         view.labels = {(name, key): MagicMock() for name in ("3y", "10y") for key in
                        ("mid", "spread", "obi", "weighted_obi", "microprice", "bid_depth", "ask_depth")}
@@ -159,6 +161,8 @@ class SafetyTests(unittest.TestCase):
         self.assertIsNotNone(view.latest_row)
         self.assertEqual(view.rejected_rows, 0)
         self.assertEqual(view.kpis["futures_yield_spread_bp"].config.call_args.kwargs["text"], "+27.6")
+        self.assertIsNotNone(view.auto_dv01)
+        self.assertAlmostEqual(view.engine.beta, view.auto_dv01["beta"])
         stamp = datetime.fromisoformat(row["timestamp_utc"])
         self.assertTrue(metric_is_fresh(row, "futures_yield_spread_bp", stamp, ExtraSettings()))
         self.assertFalse(metric_is_fresh({**row, "3y_trade_time": (stamp - timedelta(minutes=1)).isoformat(),
@@ -412,7 +416,7 @@ class SafetyTests(unittest.TestCase):
                     view.refresh()
                 self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 40)
                 self.assertIsNotNone(view.fast_result)
-                self.assertEqual(view.risk_reset_reason, "data_gap")
+                self.assertEqual(view.risk_reset_reason, "data_gap_resumed")
                 view.alert_engine.update.assert_not_called()
                 self.assertIsNotNone(view.latest_row)
                 with path.open("a", newline="", encoding="utf-8") as handle:
@@ -452,6 +456,46 @@ class SafetyTests(unittest.TestCase):
             view.curve_tracker.update.assert_not_called()
             view.alert_engine.update.assert_not_called()
 
+    def test_automatic_dv01_is_session_fixed_and_does_not_reset_other_tabs(self):
+        view = self._headless_dashboard([])
+        foreign = view.foreign_trackers
+        curve = view.curve_tracker
+        alerts = view.alert_engine
+        row = {**quote(), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+               "3y_futures_yield_pct": 3.913,
+               "10y_futures_yield_pct": 4.194}
+        self.assertTrue(view._configure_auto_dv01(row))
+        self.assertIs(view.foreign_trackers, foreign)
+        self.assertIs(view.curve_tracker, curve)
+        self.assertIs(view.alert_engine, alerts)
+        self.assertGreater(view.settings.risk.dv01_10y_krw_per_bp,
+                           view.settings.risk.dv01_3y_krw_per_bp)
+        frozen = view.settings.risk
+        self.assertFalse(view._configure_auto_dv01(
+            {**row, "3y_futures_yield_pct": 4.0, "10y_futures_yield_pct": 4.3}))
+        self.assertEqual(view.settings.risk, frozen)
+        manual = RiskSettings(dv01_3y_krw_per_bp=30_000, dv01_10y_krw_per_bp=90_000)
+        view.base_settings = replace(view.base_settings, risk=manual)
+        self.assertFalse(view._configure_auto_dv01(row))
+        stale_view = self._headless_dashboard([])
+        stale_row = {**row, "timestamp_utc":
+                     (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()}
+        self.assertFalse(stale_view._configure_auto_dv01(stale_row))
+        self.assertIsNone(stale_view.auto_dv01)
+
+    def test_csv_reset_discards_automatic_dv01_and_derived_cash_report(self):
+        view = self._headless_dashboard([])
+        row = {**quote(), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+               "3y_futures_yield_pct": 3.913, "10y_futures_yield_pct": 4.194}
+        self.assertTrue(view._configure_auto_dv01(row))
+        view.cash_risk_report = {"status": "research_proxy", "target_packages": 99}
+        view.tail.read_new.return_value = ([], True)
+        with patch("dashboard.current_csv", return_value=Path("missing-new-session.csv")):
+            view.refresh()
+        self.assertIsNone(view.auto_dv01)
+        self.assertIs(view.settings, view.base_settings)
+        self.assertEqual(view.cash_risk_report["status"], "missing_history")
+
     def test_foreign_rolling_windows_exclude_old_flow_and_flag_partial_history(self):
         tracker = ForeignFlowTracker("3y", ExtraSettings())
         base = {**quote(), "3y_foreign_buy": 100, "3y_foreign_sell": 100,
@@ -485,6 +529,21 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(tracker.summary()["windows"][5]["net_volume"], 0)
         tracker.update({**row, "3y_trade_price": ""}, START + timedelta(seconds=3610), "session")
         self.assertEqual(tracker.summary()["windows"], {})
+
+    def test_foreign_flow_gap_keeps_observed_history_and_skips_unknown_delta(self):
+        tracker = ForeignFlowTracker("3y", ExtraSettings())
+        base = {**quote(), "3y_foreign_buy": 100, "3y_foreign_sell": 100,
+                "3y_trade_price": 105.0}
+        tracker.update(base, START, "session")
+        tracker.update({**base, "3y_foreign_buy": 110}, START + timedelta(seconds=5), "session")
+        tracker.update({**base, "3y_foreign_buy": 160}, START + timedelta(seconds=30), "session")
+        resumed = tracker.summary()
+        self.assertEqual(resumed["buy"]["observed_volume"], 10)
+        self.assertEqual(resumed["windows"][5]["net_volume"], 10)
+        self.assertFalse(resumed["windows"][5]["complete"])
+        tracker.update({**base, "3y_foreign_buy": 170}, START + timedelta(seconds=35), "session")
+        self.assertEqual(tracker.summary()["buy"]["observed_volume"], 20)
+        self.assertEqual(tracker.summary()["windows"][5]["net_volume"], 20)
 
     def test_cash_curve_uses_completed_minutes_and_resets_missing_feed(self):
         curve = CashCurveTracker()
@@ -593,6 +652,18 @@ class SafetyTests(unittest.TestCase):
             engine.update(quote(10))
         self.assertEqual(len(engine.fast.levels), 0)
 
+    def test_history_replay_preserves_same_day_rv_but_breaks_gap_return(self):
+        engine = SignalEngine(AppSettings())
+        engine.update(quote(0, 100), preserve_history_on_gap=True)
+        engine.update(quote(5, 101), preserve_history_on_gap=True)
+        engine.consensus.state = 1
+        result = engine.update(quote(30, 110), preserve_history_on_gap=True)
+        self.assertEqual(result.reset_reason, "data_gap_resumed")
+        self.assertEqual(result.state, 0)
+        self.assertEqual(result.fast["samples"], 3)
+        self.assertEqual(len(engine.fast.changes), 1)
+        self.assertEqual(engine.fast.changes[0], 1)
+
     def test_completed_minutes_never_include_current_in_reference(self):
         analyzer = MinuteRVAnalyzer(2, 1)
         analyzer.update(quote(0, 100))
@@ -605,6 +676,18 @@ class SafetyTests(unittest.TestCase):
         self.assertAlmostEqual(result["level_mean"], 1.5)
         self.assertEqual(result["latest_rv_level"], 20)
         self.assertFalse(analyzer.update(quote(300))["ready"])
+
+    def test_minute_history_keeps_both_sides_of_gap_without_cross_gap_return(self):
+        analyzer = MinuteRVAnalyzer(10, 1, min_samples=4)
+        analyzer.update(quote(0, 100))
+        analyzer.update(quote(60, 101))
+        analyzer.pause(quote(180)["timestamp_utc"])
+        analyzer.update(quote(180, 110))
+        analyzer.update(quote(240, 111))
+        result = analyzer.update(quote(300, 112))
+        self.assertEqual(result["samples"], 4)
+        self.assertEqual(result["minute_change_samples"], 2)
+        self.assertFalse(result["minute_change_ready"])
 
     def test_fast_memory_and_time_span_bounded(self):
         analyzer = RollingRVAnalyzer(3, 1)
