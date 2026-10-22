@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+import sys
 import tempfile
 import unittest
 from collections import deque
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from types import MethodType, SimpleNamespace
 
 import monitor_launcher
+import ktb_rtd_monitor
 from analyze_snapshots import MinuteRVAnalyzer, RollingRVAnalyzer, timestamp_kst
 from cash_risk import CashDay, _changes, load_cash_days, oos_check, target_packages
 from curve_context import CashCurveTracker
@@ -87,10 +89,62 @@ class SafetyTests(unittest.TestCase):
         sheet = MagicMock()
         sheet.range.side_effect = RuntimeError("COM unavailable")
         reader._sheet = sheet
-        with self.assertRaises(ExcelConnectionUnavailable):
+        with patch("ktb_rtd_monitor.time.sleep") as delay, self.assertRaises(ExcelConnectionUnavailable):
             reader.snapshot()
+        self.assertEqual([item.args[0] for item in delay.call_args_list], [.15, .35])
+        self.assertEqual(sheet.range.call_count, 3)
         self.assertIsNone(reader._sheet)
         self.assertFalse(isinstance(FeedUnavailable("bad quote"), ExcelConnectionUnavailable))
+
+    def test_excel_com_transient_failure_recovers_before_slow_backoff(self):
+        block = [[None] * 13 for _ in range(10)]
+        for offset in (0, 8):
+            block[0][offset + 4] = 100.0
+            for index in range(5):
+                block[index][offset] = 10
+                block[index][offset + 1] = 100.05 - index * .01
+                block[index + 5][offset + 1] = 100 - index * .01
+                block[index + 5][offset + 2] = 10
+        recovered_range = MagicMock()
+        recovered_range.options.return_value.value = block
+        sheet = MagicMock()
+        sheet.range.side_effect = [RuntimeError("Excel busy"), recovered_range]
+        reader = ExcelRtdReader("unused", "Sheet1")
+        reader._sheet = sheet
+        with patch("ktb_rtd_monitor.time.sleep") as delay:
+            row = reader.snapshot()
+        delay.assert_called_once_with(.15)
+        self.assertEqual(sheet.range.call_count, 2)
+        self.assertAlmostEqual(row["3y_mid"], 100.005)
+        self.assertIs(reader._sheet, sheet)
+
+    def test_extra_rtd_sheet_lookup_is_cached_and_rebound_if_invalid(self):
+        settings = parse_settings({"bindings": {
+            "cash_5y_yield_pct": {"sheet": "추가RTD", "cell": "B11"}}})
+        base, first, replacement = MagicMock(), MagicMock(), MagicMock()
+        first.range.return_value.options.return_value.value = [[3.965]]
+        replacement.range.return_value.options.return_value.value = [[3.966]]
+        base.book.sheets.__getitem__.side_effect = [first, replacement]
+        reader = ExcelRtdReader("unused", "Sheet1", settings)
+        reader._sheet = base
+        self.assertEqual(reader._extra_snapshot()["cash_5y_yield_pct"], 3.965)
+        self.assertEqual(reader._extra_snapshot()["cash_5y_yield_pct"], 3.965)
+        self.assertEqual(base.book.sheets.__getitem__.call_count, 1)
+        first.api = None
+        self.assertEqual(reader._extra_snapshot()["cash_5y_yield_pct"], 3.966)
+        self.assertEqual(base.book.sheets.__getitem__.call_count, 2)
+
+    def test_collector_refuses_duplicate_writer_for_same_output_dir(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            path = Path(folder)
+            config = path / "extra_settings.json"
+            config.write_text("{}", encoding="utf-8")
+            argv = ["ktb_rtd_monitor.py", "--output-dir", str(path),
+                    "--extra-settings", str(config)]
+            with InstanceLock(path / "collector.lock"), patch.object(sys, "argv", argv), \
+                    patch("ktb_rtd_monitor.ExcelRtdReader") as reader:
+                self.assertEqual(ktb_rtd_monitor.main(), 2)
+            reader.return_value.snapshot.assert_not_called()
 
     def test_alert_editor_deletes_selected_rules_and_saves_remaining_settings(self):
         for selected, expected in (((0, 2), ["b"]), ((0, 1, 2), [])):
@@ -153,6 +207,18 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(view.rejected_rows, 1)
         self.assertEqual(view.latest_row["timestamp_utc"], quote(5)["timestamp_utc"])
         self.assertEqual(view.fast_result["samples"], 1)
+
+    def test_live_dashboard_preserves_history_but_breaks_returns_across_gap(self):
+        now = datetime.now(timezone.utc)
+        rows = [{**quote(0, 100), "timestamp_utc": (now - timedelta(seconds=30)).isoformat()},
+                {**quote(30, 110), "timestamp_utc": now.isoformat()}]
+        view = self._headless_dashboard(rows)
+        with patch("dashboard.current_csv", return_value=Path("test.csv")):
+            view.refresh()
+        self.assertEqual(view.signal_result.reset_reason, "data_gap_resumed")
+        self.assertEqual(view.fast_result["samples"], 2)
+        self.assertEqual(len(view.engine.fast.changes), 0)
+        self.assertEqual(view.risk_reset_reason, "data_gap_resumed")
 
     def test_fresh_dashboard_accepts_all_derived_metrics(self):
         row = {**quote(), "timestamp_utc": datetime.now(timezone.utc).isoformat(),

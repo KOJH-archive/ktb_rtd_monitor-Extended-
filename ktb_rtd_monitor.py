@@ -15,6 +15,7 @@ from typing import Iterable
 from analyze_snapshots import RollingRVAnalyzer, timestamp_kst
 from extra_settings import ExtraSettings, load_extra_settings
 from market_extensions import market_metrics
+from monitor_launcher import AlreadyRunning, InstanceLock
 
 # Importing xlwings can initialize the Excel/COM stack. Keep it out of analysis,
 # dashboard, and test startup; only the collector needs it.
@@ -32,6 +33,7 @@ def _load_xlwings():
     return xw
 
 WEIGHTS = (1.0, 0.7, 0.5, 0.3, 0.2)
+COM_RETRY_DELAYS = (0.15, 0.35)
 
 
 class FeedUnavailable(RuntimeError):
@@ -135,6 +137,7 @@ class ExcelRtdReader:
                  extra_settings: ExtraSettings | None = None) -> None:
         self.workbook_name, self.sheet_name = workbook_name, sheet_name
         self._sheet: xw.Sheet | None = None
+        self._extra_sheets: dict[str, xw.Sheet] = {}
         self.extra_settings = extra_settings or ExtraSettings()
 
     def _connect(self) -> xw.Sheet:
@@ -144,16 +147,47 @@ class ExcelRtdReader:
             for book in app.books:
                 if Path(book.name).name.lower() == wanted:
                     try:
-                        return book.sheets[self.sheet_name]
+                        sheet = book.sheets[self.sheet_name]
+                        if sheet.api is None:
+                            raise ExcelConnectionUnavailable(
+                                f"Core sheet {self.sheet_name!r} returned no Excel object")
+                        return sheet
                     except KeyError as exc:
                         raise ExcelConnectionUnavailable(f"Sheet {self.sheet_name!r} is not open in {book.name!r}") from exc
         raise ExcelConnectionUnavailable(f"Open {self.workbook_name!r} in desktop Excel first (with the RTD add-in connected).")
 
     def snapshot(self) -> dict[str, object]:
+        """Read one coherent snapshot, absorbing only brief COM contention.
+
+        Invalid market values fail immediately.  Excel/COM access errors get two
+        short retries on the existing sheet object before the outer collector
+        enters its slower 3/4/5-second reconnect schedule.
+        """
+        last_error: ExcelConnectionUnavailable | None = None
+        for attempt in range(len(COM_RETRY_DELAYS) + 1):
+            try:
+                return self._snapshot_once()
+            except ExcelConnectionUnavailable as exc:
+                last_error = exc
+                if attempt < len(COM_RETRY_DELAYS):
+                    time.sleep(COM_RETRY_DELAYS[attempt])
+        self._sheet = None
+        self._extra_sheets.clear()
+        raise ExcelConnectionUnavailable(
+            f"Excel read failed after {len(COM_RETRY_DELAYS) + 1} attempts: {last_error}") from last_error
+
+    def _snapshot_once(self) -> dict[str, object]:
         try:
             self._sheet = self._sheet or self._connect()
+            if self._sheet.api is None:
+                self._sheet = None
+                self._extra_sheets.clear()
+                raise ExcelConnectionUnavailable("Core sheet reference is no longer valid")
             # One COM transfer reduces (but cannot eliminate) asynchronous RTD skew.
-            block = self._sheet.range("C2:O11").options(ndim=2).value
+            try:
+                block = self._sheet.range("C2:O11").options(ndim=2).value
+            except Exception as exc:
+                raise ExcelConnectionUnavailable(f"core quote block C2:O11 failed: {exc}") from exc
             if len(block) != 10 or any(len(values) != 13 for values in block):
                 raise FeedUnavailable("Unexpected C2:O11 shape")
             row: dict[str, object] = {"timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
@@ -168,7 +202,12 @@ class ExcelRtdReader:
                                     [values[offset + 2] for values in block[5:]],
                                     [values[offset + 1] for values in block[:5]],
                                     [values[offset] for values in block[:5]]))
-            row.update(self._extra_snapshot())
+            try:
+                row.update(self._extra_snapshot())
+            except FeedUnavailable:
+                raise
+            except Exception as exc:
+                raise ExcelConnectionUnavailable(f"extra RTD block failed: {exc}") from exc
             # Keep the persisted schema stable even when optional RTD values
             # are temporarily blank. A later valid value must not stop logging.
             row.update({"futures_spread": "", "cash_spread_bp": "",
@@ -181,10 +220,9 @@ class ExcelRtdReader:
                 if key in calculated:
                     row[key] = calculated[key]
             return row
+        except FeedUnavailable:
+            raise
         except Exception as exc:
-            self._sheet = None
-            if isinstance(exc, FeedUnavailable):
-                raise
             raise ExcelConnectionUnavailable(f"Excel read failed: {exc}") from exc
 
     @staticmethod
@@ -217,12 +255,26 @@ class ExcelRtdReader:
         yields = {"cash_3y_yield_pct", "cash_5y_yield_pct", "cash_10y_yield_pct",
                   "3y_futures_yield_pct", "10y_futures_yield_pct"}
         for sheet_name, bindings in groups.items():
-            sheet = self._sheet if sheet_name == self.sheet_name else self._sheet.book.sheets[sheet_name]
+            if sheet_name == self.sheet_name:
+                sheet = self._sheet
+            else:
+                sheet = self._extra_sheets.get(sheet_name)
+                if sheet is None or sheet.api is None:
+                    self._extra_sheets.pop(sheet_name, None)
+                    sheet = self._sheet.book.sheets[sheet_name]
+                    if sheet.api is None:
+                        raise ExcelConnectionUnavailable(
+                            f"Extra RTD sheet {sheet_name!r} returned no Excel object")
+                    self._extra_sheets[sheet_name] = sheet
             positions = {key: self._cell_parts(binding.cell) for key, binding in bindings}
             rows, columns = zip(*positions.values())
             top, bottom, left, right = min(rows), max(rows), min(columns), max(columns)
             address = f"{self._cell_address(top, left)}:{self._cell_address(bottom, right)}"
-            values = sheet.range(address).options(ndim=2).value
+            try:
+                values = sheet.range(address).options(ndim=2).value
+            except Exception:
+                self._extra_sheets.pop(sheet_name, None)
+                raise
             if not isinstance(values, list):
                 values = [[values]]
             for key, (row_number, column_number) in positions.items():
@@ -412,6 +464,12 @@ def main() -> int:
     rv_state = RollingRV()
     poll_schedule = PollSchedule(args.interval_ms)
     last_error_times: dict[str, float] = {}
+    collector_lock = InstanceLock(args.output_dir.resolve() / "collector.lock")
+    try:
+        collector_lock.__enter__()
+    except AlreadyRunning:
+        print("[collector] Another collector already owns this output directory; exiting.", file=sys.stderr)
+        return 2
     try:
         while True:
             started = time.perf_counter()
@@ -457,6 +515,7 @@ def main() -> int:
     finally:
         if logger is not None:
             logger.close()
+        collector_lock.__exit__(None, None, None)
     return 0
 
 

@@ -631,7 +631,7 @@ class Dashboard(tk.Tk):
         core_samples = int(core.get("samples", 0))
         start = (timestamp_kst(self.risk_window_started_at).strftime("%H:%M:%S")
                  if self.risk_window_started_at else "대기")
-        reason = {"data_gap": "실시간 데이터 공백 후", "data_gap_resumed": "재실행 공백 연결 제외·당일 이력 복원",
+        reason = {"data_gap": "실시간 데이터 공백 후", "data_gap_resumed": "데이터 공백 연결 제외·당일 이력 유지",
                   "calendar_day_change": "날짜 변경 후",
                   "invalid_row": "불량 데이터 후", "startup": "당일 기록 복원/시작"}.get(
                       self.risk_reset_reason, "현재")
@@ -703,7 +703,10 @@ class Dashboard(tk.Tk):
                             if not math.isfinite(float(row[f"{name}_{key}"])):
                                 raise ValueError("Non-finite display metric")
                     self._configure_auto_dv01(row)
-                    result = self.engine.update(row)
+                    # Block while the feed is stale, but do not throw away
+                    # valid same-day minute history after a transient outage.
+                    # The engine still breaks return/confirmation continuity.
+                    result = self.engine.update(row, preserve_history_on_gap=True)
                 except (KeyError, ValueError, TypeError):
                     self.rejected_rows += 1
                     self._reset_analyzers()
