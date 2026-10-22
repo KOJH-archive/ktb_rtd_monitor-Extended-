@@ -15,6 +15,7 @@ WORKBOOK = ROOT / "국채선물 호가창.xlsx"
 DATA_DIR = ROOT / "data"
 LOG_PATH = DATA_DIR / "launcher.log"
 LOCK_PATH = DATA_DIR / "monitor_launcher.lock"
+DASHBOARD_LOCK_PATH = DATA_DIR / "dashboard.lock"
 MAX_LOG_BYTES = 2 * 1024 * 1024
 
 
@@ -85,6 +86,14 @@ def _stop(process: subprocess.Popen, timeout: float = 5.0) -> None:
         process.wait(timeout=timeout)
 
 
+def _run_dashboard(log) -> int:
+    """Open one dashboard, attaching to an already-running collector if needed."""
+    with InstanceLock(DASHBOARD_LOCK_PATH):
+        dashboard = subprocess.Popen([str(PYTHONW), str(ROOT / "dashboard.py")],
+                                     cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        return dashboard.wait()
+
+
 def main() -> int:
     if not PYTHON.is_file() or not PYTHONW.is_file():
         _notify("KTB 모니터", ".venv32 Python 실행 환경을 찾을 수 없습니다.")
@@ -107,17 +116,22 @@ def main() -> int:
                     if collector.poll() is not None:
                         _notify("KTB 모니터", "수집기가 시작되지 않았습니다. data\\launcher.log를 확인하세요.")
                         return 1
-                    dashboard = subprocess.Popen([str(PYTHONW), str(ROOT / "dashboard.py")],
-                                                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-                    dashboard.wait()
-                    return dashboard.returncode or 0
+                    return _run_dashboard(log)
                 finally:
                     _stop(collector)
                     log.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] one-click launcher stopped\n")
                     log.flush()
     except AlreadyRunning as exc:
-        _notify("KTB 모니터", str(exc))
-        return 0
+        # The standalone spread chart may own collector.lock. Attach the
+        # normal dashboard to that collector instead of treating it as a
+        # startup failure. A second dashboard is still refused separately.
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with LOG_PATH.open("a", encoding="utf-8") as log:
+                return _run_dashboard(log)
+        except AlreadyRunning:
+            _notify("KTB 모니터", "대시보드가 이미 실행 중입니다.")
+            return 0
     except Exception as exc:
         _notify("KTB 모니터", f"실행 중 오류가 발생했습니다.\n{exc}\n\ndata\\launcher.log를 확인하세요.")
         return 1
