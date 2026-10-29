@@ -113,7 +113,12 @@ def main() -> int:
                                              stderr=subprocess.STDOUT, creationflags=hidden)
                 try:
                     time.sleep(1.0)
-                    if collector.poll() is not None:
+                    collector_status = collector.poll()
+                    if collector_status == 2:
+                        # A standalone spread chart may already own the
+                        # collector lock. Attach the dashboard to it.
+                        return _run_dashboard(log)
+                    if collector_status is not None:
                         _notify("KTB 모니터", "수집기가 시작되지 않았습니다. data\\launcher.log를 확인하세요.")
                         return 1
                     return _run_dashboard(log)
