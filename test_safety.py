@@ -189,8 +189,37 @@ class SafetyTests(unittest.TestCase):
             setattr(view, name, MagicMock())
         view.labels = {(name, key): MagicMock() for name in ("3y", "10y") for key in
                        ("mid", "spread", "obi", "weighted_obi", "microprice", "bid_depth", "ask_depth")}
+        view.flow_briefs = {name: (MagicMock(), MagicMock()) for name in ("3y", "10y")}
+        view.book_history = {name: (MagicMock(), MagicMock()) for name in ("3y", "10y")}
+        view.notebook = MagicMock()
+        view.notebook.index.return_value = 0
+        view.foreign_profiles = {name: MagicMock() for name in ("3y", "10y")}
+        view.profile_mode = MagicMock()
+        view.profile_mode.get.return_value = "gross"
         view.tail.read_new.return_value = (rows, False)
         return view
+
+    def test_dashboard_flow_cards_share_summary_and_clear_on_data_loss(self):
+        view = self._headless_dashboard([])
+        row = {**quote(), "3y_trade_price": 105.0,
+               "3y_foreign_buy": 100, "3y_foreign_sell": 100}
+        tracker = view.foreign_trackers["3y"]
+        tracker.update(row, START, "today")
+        for second in range(5, 301, 5):
+            row = {**row, "timestamp_utc": (START + timedelta(seconds=second)).isoformat(),
+                   "3y_trade_price": 105 + second * .001, "3y_foreign_buy": 100 + second}
+            tracker.update(row, START + timedelta(seconds=second), "today")
+        with patch.object(tracker, "summary", wraps=tracker.summary) as summary:
+            view._render_overview(row, True)
+            summary.assert_called_once()
+        headline, detail = view.flow_briefs["3y"]
+        self.assertIn("외국인 순매수", headline.config.call_args.kwargs["text"])
+        self.assertIn("+300계약", detail.config.call_args.kwargs["text"])
+        self.assertIn("추가 RTD 미연결", view.foreign_10y.config.call_args.kwargs["text"])
+        view._render_overview(row, False)
+        self.assertEqual(headline.config.call_args.kwargs["text"], "최신 데이터 대기")
+        view._clear_market_display()
+        self.assertEqual(headline.config.call_args.kwargs["text"], "수급·가격 데이터 대기")
 
     def test_dashboard_stale_and_future_times_block_signal(self):
         for stamp in ("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00"):
@@ -199,6 +228,48 @@ class SafetyTests(unittest.TestCase):
                 view.refresh()
             self.assertIn("사용 금지", view.decision.config.call_args.kwargs["text"])
             self.assertEqual(view.kpis["3y_trade_price"].config.call_args.kwargs["text"], "—")
+
+    def test_book_history_survives_invalid_live_rows_and_stale_display(self):
+        rows = [quote(0), quote(5), {**quote(10), "3y_obi": float("nan")}, quote(15), quote(20)]
+        view = self._headless_dashboard(rows)
+        with patch("dashboard.current_csv", return_value=Path("test.csv")):
+            while view.tail.read_new.call_count == 0 or view.pending_rows:
+                view.refresh()
+        for name in ("3y", "10y"):
+            self.assertEqual(view.book_trackers[name].summary()["day"]["observed_seconds"], 10)
+            self.assertIn("마지막 집계", view.book_history[name][0].config.call_args.kwargs["text"])
+
+    def test_profile_only_reads_visible_views_and_suppresses_stale_current_marker(self):
+        view = self._headless_dashboard([])
+        row = {**quote(), "3y_trade_price": 105.0, "3y_foreign_buy": 100, "3y_foreign_sell": 100}
+        tracker = view.foreign_trackers["3y"]
+        tracker.update(row, START, "today")
+        tracker.update({**row, "3y_foreign_buy": 110}, START + timedelta(seconds=5), "today")
+        with patch.object(tracker, "price_profile", wraps=tracker.price_profile) as snapshot:
+            view._render_overview(row, True)
+            snapshot.assert_not_called()
+            view.notebook.index.return_value = 2
+            view._render_overview(row, True)
+            snapshot.assert_called_once()
+        args = view.foreign_profiles["3y"].set_data.call_args.args
+        self.assertEqual(args[0]["buy_volume"], 10)
+        self.assertEqual(args[1], 105.0)
+        view._render_overview({**row, "3y_trade_time": "invalid"}, True)
+        self.assertIsNone(view.foreign_profiles["3y"].set_data.call_args.args[1])
+        view._render_overview(None, False)
+        args = view.foreign_profiles["3y"].set_data.call_args.args
+        self.assertEqual(args[0]["buy_volume"], 10)
+        self.assertIsNone(args[1])
+        self.assertFalse(args[2])
+
+    def test_large_profile_view_updates_even_when_another_tab_is_selected(self):
+        view = self._headless_dashboard([])
+        view.foreign_profile_popup = SimpleNamespace(winfo_exists=lambda: True)
+        view.popup_foreign_profiles = {name: MagicMock() for name in ("3y", "10y")}
+        view._render_overview(None, False)
+        for name in ("3y", "10y"):
+            view.popup_foreign_profiles[name].set_data.assert_called_once()
+            view.foreign_profiles[name].set_data.assert_not_called()
 
     def test_dashboard_bad_row_does_not_discard_rest_of_batch(self):
         view = self._headless_dashboard([{**quote(), "3y_spread": 0}, quote(5)])
@@ -540,6 +611,7 @@ class SafetyTests(unittest.TestCase):
                 while view.flow_history is not None:
                     view.refresh()
                 self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 40)
+                self.assertEqual(view.foreign_trackers["3y"].price_profile()["buy_volume"], 40)
                 self.assertIsNotNone(view.fast_result)
                 self.assertEqual(view.risk_reset_reason, "data_gap_resumed")
                 view.alert_engine.update.assert_not_called()
@@ -550,6 +622,7 @@ class SafetyTests(unittest.TestCase):
                                      "3y_foreign_buy": 200, "3y_trade_price": 106})
                 view.refresh()
                 self.assertEqual(view.foreign_trackers["3y"].summary()["buy"]["observed_volume"], 50)
+                self.assertEqual(view.foreign_trackers["3y"].price_profile()["buy_volume"], 50)
                 self.assertIsNotNone(view.latest_row)
                 view.alert_engine.update.assert_called_once()
 
@@ -577,6 +650,10 @@ class SafetyTests(unittest.TestCase):
                     view.refresh()
             self.assertEqual(view.fast_result["samples"], 30)
             self.assertGreaterEqual(view.core_result["samples"], 2)
+            for name in ("3y", "10y"):
+                stats = view.book_trackers[name].summary()
+                self.assertAlmostEqual(stats["day"]["observed_seconds"], 145)
+                self.assertAlmostEqual(stats["windows"][5]["coverage"], 145 / 300)
             view.flow_analyzer.update.assert_not_called()
             view.curve_tracker.update.assert_not_called()
             view.alert_engine.update.assert_not_called()

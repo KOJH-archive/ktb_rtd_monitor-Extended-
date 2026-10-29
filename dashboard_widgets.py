@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
+from foreign_profile import ForeignPriceProfile
 
 BG = "#eef2f6"
 PANEL = "#ffffff"
@@ -81,6 +82,40 @@ def scroll_page(notebook, title):
     return page
 
 
+def open_profile_window(view):
+    popup = getattr(view, "foreign_profile_popup", None)
+    if popup is not None and popup.winfo_exists():
+        popup.lift()
+        return
+    popup = tk.Toplevel(view)
+    popup.title("외국인 가격대 지도 · 당일 관측")
+    popup.geometry("1100x640")
+    popup.minsize(960, 560)
+    popup.configure(bg=BG)
+    view.foreign_profile_popup = popup
+    body = tk.Frame(popup, bg=PANEL, padx=18, pady=14)
+    body.pack(fill="both", expand=True, padx=12, pady=12)
+    text(body, "외국인 가격대 지도 · 당일 관측 누적", 15, bold=True).pack(fill="x")
+    controls = tk.Frame(body, bg=PANEL)
+    controls.pack(fill="x", pady=(6, 10))
+    for title, mode in (("매수·매도 관측량", "gross"), ("순매수 차이", "net")):
+        tk.Radiobutton(controls, text=title, variable=view.profile_mode, value=mode,
+                       bg=PANEL, selectcolor=PANEL, font=("맑은 고딕", 10)).pack(side="left", padx=(0, 12))
+    text(body, "청록: 매수 · 주황: 매도 · 금색 점선: 현재가 · 마우스를 올리면 해당 가격대 수치가 표시됩니다.",
+         9, MUTED).pack(fill="x")
+    charts = tk.Frame(body, bg=PANEL)
+    charts.pack(fill="both", expand=True, pady=8)
+    charts.rowconfigure(0, weight=1)
+    view.popup_foreign_profiles = {}
+    for column, (name, title) in enumerate((("3y", "3년 선물"), ("10y", "10년 선물"))):
+        charts.columnconfigure(column, weight=1, uniform="profile")
+        chart = ForeignPriceProfile(charts, title)
+        chart.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 12, 0))
+        view.popup_foreign_profiles[name] = chart
+    text(body, "관측량은 실제 외국인 체결가·잔고가 아닙니다. 최초 관측 이전 거래와 연결 공백은 가격대에 배정하지 않습니다.",
+         9, MUTED).pack(fill="x")
+
+
 def build_dashboard(view):
     view.title("KTB | 국채선물 모니터")
     view.geometry("1180x800")
@@ -119,6 +154,20 @@ def build_dashboard(view):
         value.pack(fill="x", pady=(5, 0))
         text(card, unit, 9, MUTED).pack(fill="x")
         view.kpis[key] = value
+
+    briefs = tk.Frame(shell, bg=BG)
+    briefs.pack(fill="x", pady=(10, 0))
+    view.flow_briefs = {}
+    for column, (name, title) in enumerate((("3y", "3년 선물 · 지금 수급과 가격"),
+                                            ("10y", "10년 선물 · 지금 수급과 가격"))):
+        briefs.columnconfigure(column, weight=1, uniform="brief")
+        card = panel(briefs, title)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+        headline = row_label(card, "수급·가격 데이터 대기", size=12, bold=True, color=MUTED)
+        detail = row_label(card, "최근 5분 관측으로 요약합니다.", size=9, color=MUTED)
+        view.flow_briefs[name] = (headline, detail)
+    text(shell, "최근 5분 관측 요약 · 추정가는 외국인 실제 체결원가와 다릅니다 · 원천시각 미연결 시 수집시각 기준",
+         9, MUTED).pack(fill="x", pady=(3, 0))
 
     view.decision = text(shell, "데이터 대기", 11, ACCENT, True, padx=12, pady=9)
     view.decision.pack(fill="x", pady=(10, 8))
@@ -178,7 +227,34 @@ def build_dashboard(view):
     view.core_rv = row_label(signal, "주 RV: 대기", size=10, bold=True)
     view.window_note = row_label(signal, "60분 기준은 장중 관측용이며 수일·수주 적정가 기준은 없습니다.", size=9, color=MUTED)
 
-    flow = panel(foreign_page, "외국인 관측 가격대", "누적 매수·매도 증가량에 당시 체결가를 결합한 추정치입니다.")
+    profile = panel(foreign_page, "외국인 가격대별 관측 분포 · 당일 누적",
+                    "매수·매도 증가량을 관측 당시 선물 체결가에 배정합니다. 막대가 길수록 해당 가격대의 관측량이 많습니다.")
+    profile.pack(fill="x", pady=(0, 8))
+    controls = tk.Frame(profile, bg=PANEL)
+    controls.pack(fill="x", pady=(0, 6))
+    view.profile_mode = tk.StringVar(value="gross")
+    view.foreign_profile_popup = None
+    view.popup_foreign_profiles = {}
+    for title, mode in (("매수·매도 관측량", "gross"), ("순매수 차이", "net")):
+        tk.Radiobutton(controls, text=title, variable=view.profile_mode, value=mode,
+                       bg=PANEL, fg=INK, selectcolor=PANEL, activebackground=PANEL,
+                       font=("맑은 고딕", 9), cursor="hand2").pack(side="left", padx=(0, 12))
+    tk.Button(controls, text="크게 보기", command=lambda: open_profile_window(view),
+              bg=ACCENT, fg="white", relief="flat", font=("맑은 고딕", 9),
+              padx=12, pady=3, cursor="hand2").pack(side="right")
+    charts = tk.Frame(profile, bg=PANEL)
+    charts.pack(fill="x")
+    view.foreign_profiles = {}
+    for column, (name, title) in enumerate((("3y", "3년 선물"), ("10y", "10년 선물"))):
+        charts.columnconfigure(column, weight=1, uniform="profile")
+        chart = ForeignPriceProfile(charts, title)
+        chart.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 12, 0))
+        view.foreign_profiles[name] = chart
+    row_label(profile, "청록: 매수 / 주황: 매도 · 가격 구간은 하단 이상~상단 미만입니다. 넓은 가격 범위는 구간을 합쳐 전체를 표시합니다.\n"
+              "순매수는 관측 매수−매도이며 실제 보유잔고가 아닙니다. 최초 관측 이전 거래·연결 공백은 가격대에 배정하지 않습니다.",
+              size=9, color=MUTED)
+
+    flow = panel(foreign_page, "외국인 관측 가격대 · 수치 상세", "누적 매수·매도 증가량에 당시 체결가를 결합한 추정치입니다.")
     flow.pack(fill="x")
     view.foreign_3y = row_label(flow, "3Y 외국인: 데이터 대기", size=11)
     tk.Frame(flow, bg=LINE, height=1).pack(fill="x", pady=10)
@@ -189,7 +265,25 @@ def build_dashboard(view):
     market.pack(fill="x", pady=10)
     view.market_spreads = row_label(market, "추가 RTD 대기", size=10)
 
-    book = panel(book_page, "호가 상세", "호가잔량은 체결 수급과 구분해서 봅니다.")
+    history = panel(book_page, "호가 누적 관측 · 시간 기준",
+                    "인접 관측 사이에는 직전 호가가 유지됐다고 가정해 시간을 가중합니다. 연결 공백은 제외합니다.")
+    history.pack(fill="x", pady=(0, 8))
+    columns = tk.Frame(history, bg=PANEL)
+    columns.pack(fill="x")
+    view.book_history = {}
+    for column, (name, title) in enumerate((("3y", "3년 선물"), ("10y", "10년 선물"))):
+        columns.columnconfigure(column, weight=1, uniform="book_history")
+        contract = tk.Frame(columns, bg=PANEL, padx=6)
+        contract.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
+        row_label(contract, title, bold=True, color=ACCENT)
+        headline = row_label(contract, "시간 누적 관측 대기", size=10, bold=True)
+        detail = row_label(contract, "연속 호가 수집 중", size=9)
+        view.book_history[name] = (headline, detail)
+    row_label(history, "OBI = (5단계 매수잔량 − 매도잔량) / 합계. 우위시간은 OBI ≥ +0.10 / ≤ −0.10 기준입니다.\n"
+              "비율은 유효 관측시간 기준이며, 관측률은 해당 창 중 집계 가능한 시간입니다. 당일은 기록 시작 이후 기준입니다.\n"
+              "잔량은 취소될 수 있습니다. 체결수급·외국인 수급과 다르며 ±0.10은 표시 구분선입니다.", size=9, color=MUTED)
+
+    book = panel(book_page, "현재 호가 상세 · 순간값", "위 누적 관측과 아래 현재 호가를 함께 비교합니다.")
     book.pack(fill="x")
     view.labels = {}
     for column, name in enumerate(("항목", "3년", "10년", "의미")):

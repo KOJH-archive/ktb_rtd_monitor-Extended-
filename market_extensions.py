@@ -345,6 +345,8 @@ class ForeignFlowTracker:
         self.buy, self.sell = _Side(), _Side()
         self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
         self.resets = 0
+        self._profile_revision = 0
+        self._profile_cache: dict[str, object] | None = None
 
     def reset(self, buy: float | None = None, sell: float | None = None,
               timestamp: datetime | None = None, session=None) -> None:
@@ -354,6 +356,8 @@ class ForeignFlowTracker:
         self.buy, self.sell = _Side(), _Side()
         self.windows = {minutes: _RollingForeignWindow(minutes) for minutes in (1, 5, 15, 60)}
         self.resets += 1
+        self._profile_revision += 1
+        self._profile_cache = None
 
     def pause(self) -> None:
         """Keep observed zones/windows, but never price a gap's unknown fills."""
@@ -385,10 +389,26 @@ class ForeignFlowTracker:
         buy_change, sell_change = buy - self.previous[0], sell - self.previous[1]
         self.buy.add(buy_change, price, yield_pct, self.settings.price_bin_points)
         self.sell.add(sell_change, price, yield_pct, self.settings.price_bin_points)
+        if buy_change > 0 or sell_change > 0:
+            self._profile_revision += 1
+            self._profile_cache = None
         for window in self.windows.values():
             window.add(timestamp, buy_change, sell_change, price)
         self.previous, self.previous_time, self.session = (buy, sell), timestamp, session
         self.last_observed = (buy, sell)
+
+    def price_profile(self) -> dict[str, object]:
+        """Cached immutable band tuples; called only by the visible chart."""
+        if self._profile_cache is None:
+            lows = sorted(self.buy.bins.keys() | self.sell.bins.keys())
+            self._profile_cache = {
+                "revision": self._profile_revision,
+                "bin_size": self.settings.price_bin_points,
+                "bins": tuple((low, self.buy.bins.get(low, 0.0), self.sell.bins.get(low, 0.0))
+                              for low in lows),
+                "buy_volume": self.buy.volume, "sell_volume": self.sell.volume,
+            }
+        return self._profile_cache
 
     def summary(self) -> dict[str, object]:
         windows = ({minutes: window.summary(self.previous_time, self.started_time)

@@ -10,11 +10,14 @@ from app_settings import AppSettings, effective_beta, load_settings
 from decision_support import OrderFlowAnalyzer, basis_metrics, execution_gate, risk_metrics
 from extra_settings import METRICS, AlertRule, load_extra_settings, parse_settings
 from market_extensions import (AlertEngine, ForeignFlowTracker, WindowsNotifier,
-                               market_metrics, metric_is_fresh, source_timestamp)
+                               market_metrics, metric_is_fresh, source_timestamp,
+                               positive_optional_number)
 from signal_engine import SignalEngine, validated_row
 from curve_context import CashCurveTracker
 from cash_risk import load_cash_days, target_packages
 from futures_dv01 import futures_dv01_pair
+from flow_brief import foreign_flow_brief
+from book_pressure import BookPressureTracker, book_pressure_text
 from relative_value import RelativeValueTracker, relative_execution_cost
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
 
@@ -183,7 +186,7 @@ class Dashboard(tk.Tk):
         build_dashboard(self)
         self.after(500, self.refresh)
 
-    def _reset_analyzers(self) -> None:
+    def _reset_analyzers(self, preserve_book: bool = False) -> None:
         self.engine = SignalEngine(self.settings)
         self.fast_analyzer = self.engine.fast
         self.core_analyzer = self.engine.core
@@ -195,6 +198,12 @@ class Dashboard(tk.Tk):
         self.alert_engine = AlertEngine(self.extra_settings.rules)
         self.notifier = WindowsNotifier(self.extra_settings)
         self.foreign_trackers = {name: ForeignFlowTracker(name, self.extra_settings) for name in ("3y", "10y")}
+        if preserve_book and hasattr(self, "book_trackers"):
+            for tracker in self.book_trackers.values():
+                tracker.pause()
+        else:
+            self.book_trackers = {name: BookPressureTracker(name, self.settings.data.max_gap_seconds)
+                                  for name in ("3y", "10y")}
         self.curve_tracker = CashCurveTracker()
         self.relative_tracker = RelativeValueTracker()
         self.relative_result: dict[str, object] | None = None
@@ -283,6 +292,8 @@ class Dashboard(tk.Tk):
                 self.fast_result, self.core_result = result.fast, result.core
                 self._record_risk_progress(result, row)
                 self._ingest_foreign_row(row, timestamp)
+                for tracker in self.book_trackers.values():
+                    tracker.update(row, timestamp)
                 self._update_relative_value(row, timestamp)
             except (KeyError, ValueError, TypeError, OverflowError):
                 # A malformed historical row breaks continuity but should not
@@ -297,11 +308,13 @@ class Dashboard(tk.Tk):
                 self.risk_reset_reason = "invalid_row"
                 for tracker in self.foreign_trackers.values():
                     tracker.pause()
+                for tracker in self.book_trackers.values():
+                    tracker.pause()
                 self.relative_tracker.pause()
                 self.relative_result = None
         if history.done:
-            # Historical observations warm only the volatility/RV windows. A
-            # historical consensus state is never carried into live decisions.
+            # History restores observed statistics, including book durations.
+            # Historical consensus never carries into live decisions.
             self.engine.consensus.reset()
             self.decision_text = "복원 완료 · 새 관측부터 판단"
             self.flow_history = None
@@ -471,12 +484,14 @@ class Dashboard(tk.Tk):
             source_time = f"현물시각 {row['cash_3y_time']}/{row['cash_10y_time']}"
         return " | ".join(parts) + f" | {source_time}"
 
-    def _foreign_text(self, name: str, row: dict[str, object]) -> str:
+    def _foreign_text(self, name: str, row: dict[str, object],
+                      summary: dict[str, object] | None = None) -> str:
         buy_total = row.get(f"{name}_foreign_buy")
         sell_total = row.get(f"{name}_foreign_sell")
         if buy_total in (None, "") or sell_total in (None, ""):
             return f"{name.upper()} 외국인 관측 가격대: 추가 RTD 미연결"
-        summary = self.foreign_trackers[name].summary()
+        if summary is None:
+            summary = self.foreign_trackers[name].summary()
         prefix = f"{name.upper()} 외국인 누적 순매수 {float(buy_total)-float(sell_total):+,.0f}"
         parts = []
         for side, label in (("buy", "매수"), ("sell", "매도")):
@@ -607,6 +622,38 @@ class Dashboard(tk.Tk):
         return curve, basis, execution
 
     def _render_overview(self, row: dict[str, object] | None, fresh: bool) -> None:
+        for name, (headline, detail) in self.book_history.items():
+            title, evidence, tone = book_pressure_text(self.book_trackers[name].summary(), fresh)
+            headline.config(text=title, fg={"buy": ACCENT, "sell": WARN}.get(tone, MUTED))
+            detail.config(text=evidence)
+        for name, (headline, detail) in self.flow_briefs.items():
+            # Share the existing summaries with the detailed tab; no CSV/COM
+            # reads or extra rolling-window calculations for these cards.
+            summary = self.foreign_trackers[name].summary() if row and fresh else {}
+            brief = foreign_flow_brief(name, row, summary, self.extra_settings, fresh)
+            headline.config(text=brief.headline, fg={"buy": ACCENT, "sell": WARN}.get(brief.tone, MUTED))
+            detail.config(text=brief.detail)
+            if row and fresh:
+                getattr(self, f"foreign_{name}").config(text=self._foreign_text(name, row, summary))
+        # Charts only consume profile snapshots while their tab is visible.
+        # Histogram sorting/copying is cached by the tracker until volume changes.
+        profile_views = []
+        if self.notebook.index("current") == 2:
+            profile_views.append(self.foreign_profiles)
+        popup = getattr(self, "foreign_profile_popup", None)
+        if popup is not None and popup.winfo_exists():
+            profile_views.append(self.popup_foreign_profiles)
+        if profile_views:
+            for name in ("3y", "10y"):
+                price = positive_optional_number(row.get(f"{name}_trade_price")) if row else None
+                price_fresh = fresh and row is not None and metric_is_fresh(
+                    row, f"{name}_trade_price", datetime.fromisoformat(str(row["timestamp_utc"])),
+                    self.extra_settings)
+                tracker = self.foreign_trackers[name]
+                profile = tracker.price_profile()
+                for charts in profile_views:
+                    charts[name].set_data(profile, price if price_fresh else None,
+                                          fresh, self.profile_mode.get(), tracker.previous_time is not None)
         metrics = market_metrics(row) if row else {}
         for key, label in self.kpis.items():
             value = metrics.get(key)
@@ -709,7 +756,7 @@ class Dashboard(tk.Tk):
                     result = self.engine.update(row, preserve_history_on_gap=True)
                 except (KeyError, ValueError, TypeError):
                     self.rejected_rows += 1
-                    self._reset_analyzers()
+                    self._reset_analyzers(preserve_book=True)
                     continue
                 if result.reset_reason:
                     self.flow_analyzer.reset()
@@ -723,6 +770,8 @@ class Dashboard(tk.Tk):
                 timestamp = datetime.fromisoformat(str(row["timestamp_utc"]))
                 if timestamp.tzinfo is None:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
+                for tracker in self.book_trackers.values():
+                    tracker.update(row, timestamp)
                 if metric_is_fresh(row, "cash_spread_bp", timestamp, self.extra_settings):
                     self.curve_tracker.update(row)
                 else:
@@ -769,8 +818,6 @@ class Dashboard(tk.Tk):
                 self.basis.config(text=self._basis_text(row))
                 self.cost.config(text=self._cost_text(row))
                 self.market_spreads.config(text=self._market_text(row))
-                self.foreign_3y.config(text=self._foreign_text("3y", row))
-                self.foreign_10y.config(text=self._foreign_text("10y", row))
                 curve_position, curve_trend = self._curve_text()
                 self.curve_position.config(text=curve_position)
                 self.curve_trend.config(text=curve_trend)
@@ -804,7 +851,7 @@ class Dashboard(tk.Tk):
             self.alert_status.config(text="오늘 데이터 대기 · 알림 중지", fg=MUTED)
             self._clear_market_display()
         except (OSError, KeyError, ValueError, TypeError, csv.Error) as exc:
-            self._reset_analyzers()
+            self._reset_analyzers(preserve_book=True)
             self.pending_rows.clear()
             self.status.config(text=f"데이터 오류: {exc}")
             self.decision.config(text="오류로 신호 차단 — 새 데이터로 재준비")
