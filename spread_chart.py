@@ -11,6 +11,7 @@ import csv
 import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -47,11 +48,16 @@ def minute_spreads(path: Path, target_date: Optional[date] = None) -> List[Tuple
     missing; no interpolation is performed across an Excel/RTD gap.
     """
     target_date = target_date or datetime.now().date()
-    buckets: Dict[str, Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]] = {}
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
+        return aggregate_rows(csv.DictReader(handle), target_date)
+
+
+def aggregate_rows(rows, target_date, buckets=None):
+    if buckets is None:
+        buckets = {}
+    for row in rows:
             key = _kst_minute(row.get("timestamp_utc", ""))
             if not key or key[:10] != target_date.isoformat():
                 continue
@@ -89,7 +95,13 @@ def latest_levels(path: Path, target_date: Optional[date] = None) -> dict:
     if not path.exists():
         return latest
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
+        return aggregate_levels(csv.DictReader(handle), target_date)
+
+
+def aggregate_levels(rows, target_date, latest=None):
+    if latest is None:
+        latest = {}
+    for row in rows:
             key = _kst_minute(row.get("timestamp_utc", ""))
             if not key or key[:10] != target_date.isoformat():
                 continue
@@ -119,6 +131,13 @@ class SpreadChart(tk.Tk):
         self.last_rows = []
         self.last_read_ok = False
         self._refresh_job = None
+        from spread_chart_feed import ChartFeed
+        self._feed = ChartFeed()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chart-reader")
+        self._read_future = None
+        self._reload_requested = False
+        self._closing = False
+        self.protocol("WM_DELETE_WINDOW", self._close)
         toolbar = tk.Frame(self, bg="#182333", height=36)
         toolbar.pack(fill="x", padx=12, pady=(10, 0))
         tk.Label(toolbar, text="10Y–3Y SPREAD", bg="#182333", fg="#e9eef5",
@@ -132,6 +151,9 @@ class SpreadChart(tk.Tk):
         self.connection_badge = tk.Label(toolbar, text="● 대기", bg="#182333", fg="#f6ad55",
                                          font=("Segoe UI", 9, "bold"))
         self.connection_badge.pack(side="right", padx=10)
+        tk.Button(toolbar, text="전체 다시 읽기", command=self._request_reload,
+                  bg="#26364a", fg="#dbe7f3", relief="flat", bd=0,
+                  padx=10, pady=4).pack(side="left", padx=6)
         levels = tk.Frame(self, bg="#101722")
         levels.pack(fill="x", padx=12, pady=(8, 0))
         self.level_labels = {}
@@ -162,7 +184,8 @@ class SpreadChart(tk.Tk):
         self._hover_points = []
         self.status = tk.Label(self, text="", anchor="w", bg="#101722", fg="#aab7c8", font=("Segoe UI", 9))
         self.status.pack(fill="x", padx=16, pady=6)
-        self.bind("<Configure>", lambda _event: self._schedule_refresh())
+        self.canvas.bind("<Configure>", self._resize)
+        self._resize_job = None
         self._schedule_refresh(150)
 
     def _schedule_refresh(self, delay: int = REFRESH_MS) -> None:
@@ -172,18 +195,31 @@ class SpreadChart(tk.Tk):
 
     def refresh(self) -> None:
         self._refresh_job = None
+        if self._closing:
+            return
+        if self._read_future is None:
+            reload_requested = self._reload_requested
+            self._reload_requested = False
+            self._read_future = self._executor.submit(self._feed.read, current_csv(self.data_dir), reload_requested)
+        self._poll_read()
+
+    def _poll_read(self):
+        if self._closing:
+            return
+        if not self._read_future.done():
+            self._refresh_job = self.after(50, self._poll_read)
+            return
+        self._refresh_job = None
         try:
-            csv_path = current_csv(self.data_dir)
-            rows = minute_spreads(csv_path)
-            if not hasattr(self, "_last_levels_refresh") or time.monotonic() - self._last_levels_refresh >= 15:
-                self._update_levels(latest_levels(csv_path))
-                self._last_levels_refresh = time.monotonic()
+            rows, levels, changed = self._read_future.result()
+            self._update_levels(levels)
             if rows:
                 self.last_rows = rows
                 self.last_read_ok = True
             elif not self.last_rows:
                 self.last_read_ok = True
-            self._draw(self._visible_rows())
+            if changed:
+                self._draw(self._visible_rows())
             self.connection_badge.config(text="● 연결 정상" if rows else "● 데이터 대기",
                                          fg="#68d391" if rows else "#f6ad55")
         except (OSError, csv.Error, ValueError) as exc:
@@ -196,7 +232,35 @@ class SpreadChart(tk.Tk):
         except Exception:
             self.last_read_ok = False
             self.connection_badge.config(text="● 재시도 중", fg="#fc8181")
-        self._schedule_refresh()
+        finally:
+            self._read_future = None
+        self._schedule_refresh(1 if self._reload_requested else REFRESH_MS)
+
+    def _request_reload(self):
+        self._reload_requested = True
+        self.connection_badge.config(text="● 다시 불러오는 중", fg="#f6ad55")
+        if self._read_future is None:
+            if self._refresh_job is not None:
+                self.after_cancel(self._refresh_job)
+                self._refresh_job = None
+            self._schedule_refresh(1)
+
+    def _resize(self, _event):
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(120, self._redraw)
+
+    def _redraw(self):
+        self._resize_job = None
+        self._draw(self._visible_rows())
+
+    def _close(self):
+        self._closing = True
+        for job in (self._refresh_job, self._resize_job):
+            if job is not None:
+                self.after_cancel(job)
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.destroy()
 
     def _update_levels(self, levels: dict) -> None:
         for name, label in self.level_labels.items():
@@ -324,10 +388,11 @@ class SpreadChart(tk.Tk):
         last_minute = datetime.strptime(rows[-1][0], "%Y-%m-%dT%H:%M")
         total_minutes = max(int((last_minute - first_minute).total_seconds() / 60), 1)
         label_step = 10 * max(1, math.ceil(total_minutes / 180))
+        minute_times = [datetime.strptime(row[0], "%Y-%m-%dT%H:%M") for row in rows]
         for minute_offset in range(0, total_minutes + 1, 10):
             target = first_minute + timedelta(minutes=minute_offset)
             index = min(range(len(rows)), key=lambda candidate: abs(
-                (datetime.strptime(rows[candidate][0], "%Y-%m-%dT%H:%M") - target).total_seconds()))
+                (minute_times[candidate] - target).total_seconds()))
             x = left + plot_w * index / n
             self.canvas.create_line(x, top, x, height - bottom, fill="#1b2939")
             if minute_offset % label_step == 0:
