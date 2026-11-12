@@ -82,6 +82,27 @@ def scroll_page(notebook, title):
     return page
 
 
+def foreign_total_cards(parent):
+    """Large signed daily flow values, shared by inline and expanded views."""
+    cards = tk.Frame(parent, bg=parent.cget("bg"))
+    cards.pack(fill="x", pady=(8, 10))
+    labels = {}
+    for column, (name, title) in enumerate((("3y", "3년 외국인 · 당일 누적"),
+                                            ("10y", "10년 외국인 · 당일 누적"))):
+        cards.columnconfigure(column, weight=1, uniform="foreign_total")
+        card = tk.Frame(cards, bg="#f3f6f9", padx=14, pady=8,
+                        highlightbackground=LINE, highlightthickness=1)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
+        text(card, title, 10, bold=True).pack(fill="x")
+        value = ValueLabel(card, text="—", bg=card.cget("bg"), fg=MUTED, anchor="w",
+                           font=("맑은 고딕", 25, "bold"))
+        value.pack(fill="x", pady=(3, 0))
+        status = text(card, "누적 매수 − 누적 매도 · 연결 대기", 9, MUTED)
+        status.pack(fill="x", pady=(2, 0))
+        labels[name] = (value, status)
+    return labels
+
+
 def open_profile_window(view):
     popup = getattr(view, "foreign_profile_popup", None)
     if popup is not None and popup.winfo_exists():
@@ -89,13 +110,14 @@ def open_profile_window(view):
         return
     popup = tk.Toplevel(view)
     popup.title("외국인 가격대 지도 · 당일 관측")
-    popup.geometry("1100x640")
-    popup.minsize(960, 560)
+    popup.geometry("1100x760")
+    popup.minsize(960, 700)
     popup.configure(bg=BG)
     view.foreign_profile_popup = popup
     body = tk.Frame(popup, bg=PANEL, padx=18, pady=14)
     body.pack(fill="both", expand=True, padx=12, pady=12)
     text(body, "외국인 가격대 지도 · 당일 관측 누적", 15, bold=True).pack(fill="x")
+    view.popup_foreign_net_totals = foreign_total_cards(body)
     controls = tk.Frame(body, bg=PANEL)
     controls.pack(fill="x", pady=(6, 10))
     for title, mode in (("매수·매도 관측량", "gross"), ("순매수 차이", "net")):
@@ -175,9 +197,33 @@ def build_dashboard(view):
     notebook.pack(fill="both", expand=True)
     view.notebook = notebook
     pages = []
-    for title in ("금리차 위치", "상대가치", "외국인 수급", "변동성 · 위험", "호가 · 비용"):
+    for title in ("금리차 위치", "상대가치", "외국인 수급", "변동성 · 위험", "호가 · 비용", "실시간 5호가"):
         pages.append(scroll_page(notebook, title))
-    curve_page, relative_page, foreign_page, risk_page, book_page = pages
+    curve_page, relative_page, foreign_page, risk_page, book_page, ladder_page = pages
+    view.ladder_labels = {}
+    view.ladder_status = row_label(ladder_page, "호가 데이터 대기", size=10)
+    ladder_columns = tk.Frame(ladder_page, bg=BG)
+    ladder_columns.pack(fill="x")
+    for column, name in enumerate(("3y", "10y")):
+        ladder_columns.columnconfigure(column, weight=1, uniform="ladder")
+        card = panel(ladder_columns, "3년 선물" if name == "3y" else "10년 선물")
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+        table = tk.Frame(card, bg=PANEL)
+        table.pack(fill="x", pady=8)
+        for c, title in enumerate(("매도잔량", "가격", "매수잔량")):
+            table.columnconfigure(c, weight=1, uniform="depth")
+            ValueLabel(table, text=title, bg=PANEL, fg=MUTED).grid(row=0, column=c, sticky="ew")
+        for r, (side, level) in enumerate(
+                [("ask", n) for n in range(5, 0, -1)] + [("bid", n) for n in range(1, 6)], 1):
+            color = "#176b83" if side == "ask" else "#a55520"
+            bg = "#eef7fb" if side == "ask" else "#fff4e9"
+            for c in range(3):
+                label = ValueLabel(table, text="—" if c == 1 or c == (0 if side == "ask" else 2) else "",
+                                   bg=bg, fg=color, font=("Consolas", 15, "bold"), padx=8, pady=7)
+                label.grid(row=r, column=c, sticky="ew", pady=(1, 0))
+                if c == 1 or c == (0 if side == "ask" else 2):
+                    view.ladder_labels[(name, side, level, "price" if c == 1 else "qty")] = label
+    row_label(ladder_page, "매도 5→1호가 / 매수 1→5호가 · 잔량 단위: 계약 · 주문 건수는 원천 데이터 미연결", size=9, color=MUTED)
 
     curve = panel(curve_page, "현물 10년 − 3년 금리차", "최근 체결수익률 차이 · bp · 수집시각 기준")
     curve.pack(fill="x")
@@ -230,11 +276,13 @@ def build_dashboard(view):
     profile = panel(foreign_page, "외국인 가격대별 관측 분포 · 당일 누적",
                     "매수·매도 증가량을 관측 당시 선물 체결가에 배정합니다. 막대가 길수록 해당 가격대의 관측량이 많습니다.")
     profile.pack(fill="x", pady=(0, 8))
+    view.foreign_net_totals = foreign_total_cards(profile)
     controls = tk.Frame(profile, bg=PANEL)
     controls.pack(fill="x", pady=(0, 6))
     view.profile_mode = tk.StringVar(value="gross")
     view.foreign_profile_popup = None
     view.popup_foreign_profiles = {}
+    view.popup_foreign_net_totals = {}
     for title, mode in (("매수·매도 관측량", "gross"), ("순매수 차이", "net")):
         tk.Radiobutton(controls, text=title, variable=view.profile_mode, value=mode,
                        bg=PANEL, fg=INK, selectcolor=PANEL, activebackground=PANEL,
@@ -268,6 +316,9 @@ def build_dashboard(view):
     history = panel(book_page, "호가 누적 관측 · 시간 기준",
                     "인접 관측 사이에는 직전 호가가 유지됐다고 가정해 시간을 가중합니다. 연결 공백은 제외합니다.")
     history.pack(fill="x", pady=(0, 8))
+    row_label(history, "OBI는 표시 잔량의 기울기입니다. +는 매수잔량 우세, −는 매도잔량 우세, 0은 양쪽 잔량이 같다는 뜻입니다. ±0.10 사이는 화면에서 균형권으로 봅니다.\n"
+              "OFI는 최근 60초 최우선 호가·잔량 변화입니다. +는 매수 쪽 변화 우세, −는 매도 쪽 변화 우세, 0은 변화가 상쇄됐다는 뜻입니다. 단위는 계약입니다.\n"
+              "둘 다 +면 매수 쪽으로, 둘 다 −면 매도 쪽으로 잔량과 변화가 함께 기울어 있습니다. 부호가 다르면 현재 잔량과 최근 변화의 방향이 엇갈립니다.", size=9, color=MUTED)
     columns = tk.Frame(history, bg=PANEL)
     columns.pack(fill="x")
     view.book_history = {}

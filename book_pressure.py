@@ -97,10 +97,47 @@ class BookPressureTracker:
         self.timestamp: datetime | None = None
         self.previous: tuple[datetime, tuple[float, ...]] | None = None
         self.active = False
+        self.clear_ofi()
+
+    def clear_ofi(self) -> None:
+        self.ofi_previous = None
+        self.ofi_events = deque()
+        self.ofi_total = 0.0
+        self.ofi_started = None
+        self.ofi_alignment = None
 
     def pause(self) -> None:
         self.previous = None
         self.active = False
+        self.clear_ofi()
+
+    def update_ofi(self, row, stamp, weighted):
+        fields = ("best_bid", "best_ask", "bid1_qty", "ask1_qty")
+        quote = tuple(optional_number(row.get(f"{self.contract}_{field}")) for field in fields)
+        if any(value is None or value <= 0 for value in quote) or quote[0] >= quote[1]:
+            self.clear_ofi()
+            return
+        if self.ofi_previous is not None:
+            previous_stamp, (old_bid, old_ask, old_bq, old_aq) = self.ofi_previous
+            if (stamp - previous_stamp).total_seconds() > self.max_gap_seconds:
+                self.clear_ofi()
+            else:
+                bid, ask, bq, aq = quote
+                change = ((bq if bid >= old_bid else 0) - (old_bq if bid <= old_bid else 0)
+                          - (aq if ask <= old_ask else 0) + (old_aq if ask >= old_ask else 0))
+                self.ofi_events.append((stamp, change))
+                self.ofi_total += change
+        if self.ofi_started is None:
+            self.ofi_started = stamp
+        cutoff = stamp - timedelta(seconds=60)
+        while self.ofi_events and self.ofi_events[0][0] <= cutoff:
+            self.ofi_total -= self.ofi_events.popleft()[1]
+        self.ofi_previous = stamp, quote
+        if self.ofi_started <= cutoff:
+            if abs(weighted) < DOMINANCE_BAND or abs(self.ofi_total) < 1e-9:
+                self.ofi_alignment = "중립"
+            else:
+                self.ofi_alignment = "방향 일치" if weighted * self.ofi_total > 0 else "방향 엇갈림"
 
     def update(self, row: dict[str, object], timestamp: datetime | None = None) -> None:
         try:
@@ -145,12 +182,16 @@ class BookPressureTracker:
                     window.advance(stamp)
         self.previous = (stamp, rates)
         self.active = True
+        self.update_ofi(row, stamp, weighted)
 
     def summary(self) -> dict[str, object]:
         elapsed = ((self.timestamp - self.started).total_seconds()
                    if self.timestamp is not None and self.started is not None else 0.0)
         return {"timestamp": self.timestamp, "started": self.started, "active": self.active,
                 "day": self.day.summary(elapsed),
+                "ofi": self.ofi_total if self.ofi_alignment is not None else None,
+                "ofi_alignment": self.ofi_alignment,
+                "current_weighted_obi": self.previous[1][1] if self.previous else None,
                 "windows": {minutes: window.totals.summary(minutes * 60)
                             for minutes, window in self.windows.items()}}
 
@@ -185,4 +226,14 @@ def book_pressure_text(summary: dict[str, object], fresh: bool) -> tuple[str, st
     started = summary["started"]
     if started is not None:
         lines.append(f"당일 기록 {started.astimezone(KST):%H:%M:%S}~{as_of} · 유효 {summary['day']['observed_seconds']/60:.1f}분")
-    return headline, "\n\n".join(lines), tone
+    ofi = summary.get("ofi") if fresh else None
+    ofi_text = (f"60초 관측 OFI {ofi:+,.0f}계약 · 현재 가중 OBI와 {summary['ofi_alignment']}"
+                if ofi is not None else "60초 관측 OFI · 연속 호가 대기")
+    if ofi is not None:
+        weighted = summary["current_weighted_obi"]
+        book_side = "매수 잔량 우세" if weighted >= DOMINANCE_BAND else (
+            "매도 잔량 우세" if weighted <= -DOMINANCE_BAND else "잔량 균형권")
+        flow_side = "매수 쪽 변화 우세" if ofi > 1e-9 else (
+            "매도 쪽 변화 우세" if ofi < -1e-9 else "양쪽 변화 균형")
+        ofi_text = f"현재 {book_side} · 최근 60초 {flow_side}\n{ofi_text}"
+    return headline, "\n\n".join([ofi_text, *lines]), tone

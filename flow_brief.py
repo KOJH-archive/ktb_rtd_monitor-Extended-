@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from extra_settings import ExtraSettings
 from market_extensions import (metric_is_fresh, optional_number,
@@ -14,6 +14,38 @@ class FlowBrief:
     headline: str
     detail: str
     tone: str = "muted"
+
+
+def foreign_net_total(name: str, row: dict[str, object] | None,
+                      settings: ExtraSettings, fresh: bool) -> FlowBrief:
+    """Display raw daily cumulative buy-minus-sell, independent of price bins."""
+    if row is None:
+        return FlowBrief("—", "누적 매수 − 누적 매도 · 연결 대기")
+    buy = optional_number(row.get(f"{name}_foreign_buy"))
+    sell = optional_number(row.get(f"{name}_foreign_sell"))
+    if buy is None or sell is None or min(buy, sell) < 0:
+        return FlowBrief("N/A", "외국인 누적 매수·매도 연결 확인")
+    net = round(buy - sell)
+    value = (f"{net:+,}" if net else "0") + " 계약"
+    state = "순매수" if net > 0 else "순매도" if net < 0 else "매수·매도 균형"
+    try:
+        stamp = datetime.fromisoformat(str(row["timestamp_utc"]))
+        if stamp.tzinfo is None:
+            raise ValueError("Missing timestamp timezone")
+        clock = stamp.astimezone(timezone(timedelta(hours=9))).strftime("%H:%M:%S")
+        source = row.get(f"{name}_foreign_time")
+        source_time = source_timestamp(source, stamp)
+        source_fresh = source in (None, "") or (source_time is not None and
+            abs((stamp.astimezone(timezone.utc) - source_time).total_seconds())
+            <= settings.max_source_age_seconds)
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return FlowBrief(value, f"{state} · 수집/원천시각 확인 필요")
+    if not fresh:
+        return FlowBrief(value, f"{state} · 갱신 대기 · 마지막 수집 {clock}")
+    if not source_fresh:
+        return FlowBrief(value, f"{state} · 원천시각 확인 필요 · 수집 {clock}")
+    return FlowBrief(value, f"{state} · 수집 {clock} 기준",
+                     "buy" if net > 0 else "sell" if net < 0 else "muted")
 
 
 def _price_zone(label: str, value: object, price: float) -> str:

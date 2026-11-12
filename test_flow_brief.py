@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from extra_settings import ExtraSettings
-from flow_brief import foreign_flow_brief
+from flow_brief import foreign_flow_brief, foreign_net_total
 from market_extensions import ForeignFlowTracker
 
 
@@ -11,6 +11,36 @@ START = datetime(2026, 10, 29, tzinfo=timezone.utc)
 
 
 class FlowBriefTests(unittest.TestCase):
+    def test_daily_total_sign_zero_and_missing_values_without_trade_price(self):
+        row = {"timestamp_utc": START.isoformat(), "3y_foreign_buy": 25000,
+               "3y_foreign_sell": 12345, "10y_foreign_buy": 100, "10y_foreign_sell": 4100}
+        settings = ExtraSettings()
+        buy = foreign_net_total("3y", row, settings, True)
+        sell = foreign_net_total("10y", row, settings, True)
+        self.assertEqual((buy.headline, buy.tone), ("+12,655 계약", "buy"))
+        self.assertEqual((sell.headline, sell.tone), ("-4,000 계약", "sell"))
+        self.assertIn("09:00:00", buy.detail)
+        for buy_value, sell_value in ((0, 0), (100, 100)):
+            total = foreign_net_total("3y", {**row, "3y_foreign_buy": buy_value,
+                                              "3y_foreign_sell": sell_value}, settings, True)
+            self.assertEqual((total.headline, total.tone), ("0 계약", "muted"))
+        for bad in ("", None, -1, True, float("nan"), float("inf")):
+            total = foreign_net_total("3y", {**row, "3y_foreign_buy": bad}, settings, True)
+            self.assertEqual(total.headline, "N/A")
+        self.assertEqual(foreign_net_total("3y", None, settings, False).headline, "—")
+
+    def test_daily_total_retains_value_but_marks_stale_or_invalid_source_time(self):
+        settings = ExtraSettings()
+        row = {"timestamp_utc": START.isoformat(), "3y_foreign_buy": 100, "3y_foreign_sell": 2100}
+        stale = foreign_net_total("3y", row, settings, False)
+        self.assertEqual((stale.headline, stale.tone), ("-2,000 계약", "muted"))
+        self.assertIn("마지막 수집 09:00:00", stale.detail)
+        for source in ("invalid", (START - timedelta(seconds=60)).isoformat()):
+            total = foreign_net_total("3y", {**row, "3y_foreign_time": source}, settings, True)
+            self.assertEqual(total.headline, "-2,000 계약")
+            self.assertEqual(total.tone, "muted")
+            self.assertIn("원천시각 확인", total.detail)
+
     def observed(self, net_buy=True, direction=1):
         settings = ExtraSettings()
         tracker = ForeignFlowTracker("3y", settings)

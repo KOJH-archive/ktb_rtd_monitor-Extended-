@@ -16,7 +16,7 @@ from signal_engine import SignalEngine, validated_row
 from curve_context import CashCurveTracker
 from cash_risk import load_cash_days, target_packages
 from futures_dv01 import futures_dv01_pair
-from flow_brief import foreign_flow_brief
+from flow_brief import foreign_flow_brief, foreign_net_total
 from book_pressure import BookPressureTracker, book_pressure_text
 from relative_value import RelativeValueTracker, relative_execution_cost
 from dashboard_widgets import ACCENT, INK, MUTED, WARN, build_dashboard
@@ -622,6 +622,33 @@ class Dashboard(tk.Tk):
         return curve, basis, execution
 
     def _render_overview(self, row: dict[str, object] | None, fresh: bool) -> None:
+        if self.notebook.index("current") == 5:
+            ladder_row = row if row is not None else self.latest_row
+            self.ladder_status.config(text="수집 최신 · 약 1초 수집 / 0.5초 화면 확인" if fresh else "갱신 대기 · 마지막 수집 호가 (현재 주문 판단 주의)",
+                                      fg=MUTED if fresh else WARN)
+            for (name, side, level, field), label in self.ladder_labels.items():
+                try:
+                    number = float(ladder_row[f"{name}_{side}{level}_{field}"])
+                    valid = math.isfinite(number) and (number > 0 if field == "price" else number >= 0)
+                except (KeyError, TypeError, ValueError):
+                    valid = False
+                label.config(text=(f"{number:.2f}" if field == "price" else f"{number:,.0f}") if valid else "—",
+                             fg=("#176b83" if side == "ask" else "#a55520") if fresh else MUTED)
+        popup = getattr(self, "foreign_profile_popup", None)
+        total_views = [self.foreign_net_totals]
+        if popup is not None and popup.winfo_exists():
+            total_views.append(self.popup_foreign_net_totals)
+        # A stale-feed clear retains the last collected daily total, with its
+        # timestamp and muted status. Day/file resets clear latest_row as before.
+        total_row = row if row is not None else self.latest_row
+        for name in ("3y", "10y"):
+            total = foreign_net_total(name, total_row, self.extra_settings, fresh and row is not None)
+            for labels in total_views:
+                if name in labels:
+                    value, status = labels[name]
+                    value.config(text=total.headline,
+                                 fg={"buy": ACCENT, "sell": WARN}.get(total.tone, MUTED))
+                    status.config(text=total.detail)
         for name, (headline, detail) in self.book_history.items():
             title, evidence, tone = book_pressure_text(self.book_trackers[name].summary(), fresh)
             headline.config(text=title, fg={"buy": ACCENT, "sell": WARN}.get(tone, MUTED))
@@ -640,7 +667,6 @@ class Dashboard(tk.Tk):
         profile_views = []
         if self.notebook.index("current") == 2:
             profile_views.append(self.foreign_profiles)
-        popup = getattr(self, "foreign_profile_popup", None)
         if popup is not None and popup.winfo_exists():
             profile_views.append(self.popup_foreign_profiles)
         if profile_views:

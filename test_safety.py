@@ -194,6 +194,8 @@ class SafetyTests(unittest.TestCase):
         view.notebook = MagicMock()
         view.notebook.index.return_value = 0
         view.foreign_profiles = {name: MagicMock() for name in ("3y", "10y")}
+        view.foreign_net_totals = {name: (MagicMock(), MagicMock()) for name in ("3y", "10y")}
+        view.popup_foreign_net_totals = {}
         view.profile_mode = MagicMock()
         view.profile_mode.get.return_value = "gross"
         view.tail.read_new.return_value = (rows, False)
@@ -220,6 +222,47 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(headline.config.call_args.kwargs["text"], "최신 데이터 대기")
         view._clear_market_display()
         self.assertEqual(headline.config.call_args.kwargs["text"], "수급·가격 데이터 대기")
+
+    def test_five_level_tab_updates_only_when_selected_and_marks_stale(self):
+        view = self._headless_dashboard([])
+        view.ladder_status = MagicMock()
+        view.ladder_labels = {(name, side, level, field): MagicMock()
+                              for name in ("3y", "10y") for side in ("ask", "bid")
+                              for level in range(1, 6) for field in ("price", "qty")}
+        row = {**quote(), **{f"{name}_{side}{level}_{field}": (105 + level / 100 if field == "price" else 1234)
+                             for name, side, level, field in view.ladder_labels}}
+        view.latest_row = row
+        view._render_overview(row, True)
+        for label in view.ladder_labels.values():
+            label.config.assert_not_called()
+        view.notebook.index.return_value = 5
+        view._render_overview(row, True)
+        self.assertEqual(view.ladder_labels[("3y", "ask", 5, "price")].config.call_args.kwargs["text"], "105.05")
+        self.assertEqual(view.ladder_labels[("10y", "bid", 1, "qty")].config.call_args.kwargs["text"], "1,234")
+        view._clear_market_display()
+        self.assertIn("갱신 대기", view.ladder_status.config.call_args.kwargs["text"])
+
+    def test_daily_foreign_totals_update_both_views_and_keep_stale_values(self):
+        view = self._headless_dashboard([])
+        view.foreign_profile_popup = SimpleNamespace(winfo_exists=lambda: True)
+        view.popup_foreign_profiles = {name: MagicMock() for name in ("3y", "10y")}
+        view.popup_foreign_net_totals = {name: (MagicMock(), MagicMock()) for name in ("3y", "10y")}
+        row = {**quote(), "3y_foreign_buy": 12000, "3y_foreign_sell": 10000,
+               "10y_foreign_buy": 1100, "10y_foreign_sell": 5600}
+        view.latest_row = row
+        view._render_overview(row, True)
+        for cards in (view.foreign_net_totals, view.popup_foreign_net_totals):
+            self.assertEqual(cards["3y"][0].config.call_args.kwargs["text"], "+2,000 계약")
+            self.assertEqual(cards["10y"][0].config.call_args.kwargs["text"], "-4,500 계약")
+        view._clear_market_display()
+        self.assertEqual(view.foreign_net_totals["10y"][0].config.call_args.kwargs["text"], "-4,500 계약")
+        self.assertIn("마지막 수집", view.foreign_net_totals["10y"][1].config.call_args.kwargs["text"])
+        view.latest_row = {**row, "10y_foreign_buy": 6000}
+        view._render_overview(view.latest_row, True)
+        self.assertEqual(view.popup_foreign_net_totals["10y"][0].config.call_args.kwargs["text"], "+400 계약")
+        view._reset_analyzers()
+        view._clear_market_display()
+        self.assertEqual(view.foreign_net_totals["10y"][0].config.call_args.kwargs["text"], "—")
 
     def test_dashboard_stale_and_future_times_block_signal(self):
         for stamp in ("2000-01-01T00:00:00+00:00", "2100-01-01T00:00:00+00:00"):
